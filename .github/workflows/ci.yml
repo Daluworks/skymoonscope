@@ -17,7 +17,6 @@ jobs:
     if: >-
       github.event_name == 'pull_request' &&
       (
-i
         github.head_ref == 'integrate-typepause' ||
         github.head_ref == 'unauthorized-admin' ||
         github.head_ref == 'admin-rotation' ||
@@ -71,7 +70,6 @@ i
     if: >-
       github.event_name != 'pull_request' ||
       (
-i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin' &&
         !contains(github.head_ref, 'staking-calculator') &&
@@ -97,7 +95,6 @@ i
     if: >-
       github.event_name != 'pull_request' ||
       (
-i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin' &&
         github.head_ref != 'admin-rotation' &&
@@ -168,6 +165,48 @@ i
         run: cargo test --locked
 
   # --------------------------------------------------------------------------
+  # Job 3b: Benchmarks (compile only)
+  # --------------------------------------------------------------------------
+  #
+  # The Criterion benchmarks under `core/benches/` were compiled by no job at
+  # all: the root workspace only contains `contracts/*`, and `core/` declares
+  # its own workspace, so the repo-wide `cargo check` / `cargo test` above never
+  # reach them. `cargo bench --no-run` compiles every bench target (and its
+  # dev-dependencies) so a benchmark that stops compiling fails CI instead of
+  # being discovered locally months later. Benchmarks are only *built* here;
+  # running them stays a manual/opt-in step because wall-clock timings are not
+  # stable enough on shared CI runners to gate on.
+  bench:
+    name: Benchmarks (compile)
+    if: >-
+      github.event_name != 'pull_request' ||
+      (
+        github.head_ref != 'integrate-typepause' &&
+        github.head_ref != 'unauthorized-admin' &&
+        github.head_ref != 'admin-rotation' &&
+        github.head_ref != 'generic-pause' &&
+        !contains(github.head_ref, 'staking-calculator') &&
+        !startsWith(github.head_ref, 'feature/')
+      )
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Cache Rust dependencies
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: core
+      - name: Install System Dependencies
+        # `core/build.rs` runs `tonic_build::compile_protos`, which shells out
+        # to `protoc`.
+        run: sudo apt-get update && sudo apt-get install -y pkg-config libdbus-1-dev libudev-dev protobuf-compiler
+      - name: Verify protoc is available
+        run: protoc --version
+      - name: Compile Criterion benchmarks (no run)
+        run: cargo bench --locked --no-run --manifest-path core/Cargo.toml
+
+  # --------------------------------------------------------------------------
   # Job 4: Frontend (Lint & Typecheck)
   # --------------------------------------------------------------------------
   frontend:
@@ -175,7 +214,6 @@ i
     if: >-
       github.event_name != 'pull_request' ||
       (
-i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin'
       )
@@ -220,7 +258,6 @@ i
     if: >-
       github.event_name != 'pull_request' ||
       (
-i
         github.head_ref != 'integrate-typepause' &&
         github.head_ref != 'unauthorized-admin'
       )
