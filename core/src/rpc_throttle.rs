@@ -87,3 +87,33 @@ mod tests {
         assert_eq!(retry_delay(&headers, UNIX_EPOCH), None);
     }
 }
+
+use std::sync::atomic::{AtomicU64, Ordering};
+
+pub struct TokenBucket {
+    tokens: AtomicU64,
+}
+
+impl TokenBucket {
+    pub fn new(initial: u64) -> Self {
+        Self {
+            tokens: AtomicU64::new(initial),
+        }
+    }
+
+    pub fn acquire(&self) -> bool {
+        let mut current = self.tokens.load(Ordering::Acquire);
+        while current > 0 {
+            match self.tokens.compare_exchange_weak(
+                current,
+                current - 1,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => return true,
+                Err(v) => current = v,
+            }
+        }
+        false
+    }
+}
