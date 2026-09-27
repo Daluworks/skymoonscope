@@ -39,6 +39,15 @@ test('validateEndpointUrl: accepts http and https URLs', () => {
   assert.equal(validateEndpointUrl('http://localhost:8000/soroban/rpc').valid, true);
 });
 
+test('validateEndpointUrl: trims surrounding whitespace from valid URLs', () => {
+  const result = validateEndpointUrl('  https://rpc.example.com/soroban/rpc  ');
+  assert.deepEqual(result, {
+    valid: true,
+    normalized: 'https://rpc.example.com/soroban/rpc',
+    error: null,
+  });
+});
+
 test('validateEndpointUrl: strips trailing slashes when normalizing', () => {
   assert.equal(validateEndpointUrl('https://rpc.example.com///').normalized, 'https://rpc.example.com');
 });
@@ -65,6 +74,22 @@ test('validateEndpointUrl: rejects non-http protocols', () => {
   const result = validateEndpointUrl('ftp://rpc.example.com');
   assert.equal(result.valid, false);
   assert.match(result.error, /Unsupported protocol/);
+});
+
+test('validateEndpointUrl: rejects javascript and data URLs', () => {
+  for (const value of ['javascript:alert(1)', 'data:text/html,<script>alert(1)</script>']) {
+    const result = validateEndpointUrl(value);
+    assert.equal(result.valid, false);
+    assert.equal(result.normalized, value);
+    assert.match(result.error, /Unsupported protocol/);
+  }
+});
+
+test('validateEndpointUrl: rejects malformed and non-URL input', () => {
+  for (const value of ['not-a-url', 'https://']) {
+    const result = validateEndpointUrl(value);
+    assert.equal(result.valid, false);
+  }
 });
 
 // ── Normalization ───────────────────────────────────────────────────────────
@@ -125,6 +150,31 @@ test('saveSettings then loadSettings round-trips normalized values', () => {
 
   assert.equal(written.rpcUrl, 'https://my-rpc.example.com');
   assert.deepEqual(loadSettings(storage), written);
+});
+
+test('saveSettings: does not persist a rejected RPC URL', () => {
+  const storage = createStorage();
+  const written = saveSettings({ rpcUrl: 'javascript:alert(1)' }, storage);
+
+  assert.equal(written.rpcUrl, '');
+  assert.deepEqual(JSON.parse(storage.getItem(SETTINGS_STORAGE_KEY)), {
+    ...DEFAULT_SETTINGS,
+    rpcUrl: '',
+  });
+  assert.equal(loadSettings(storage).rpcUrl, '');
+});
+
+test('loadSettings: strips an unsafe RPC URL already present in LocalStorage', () => {
+  const storage = createStorage({
+    [SETTINGS_STORAGE_KEY]: JSON.stringify({
+      rpcUrl: 'javascript:alert(1)',
+      indexerUrl: 'https://api.example.com',
+    }),
+  });
+
+  const loaded = loadSettings(storage);
+  assert.equal(loaded.rpcUrl, '');
+  assert.equal(loaded.indexerUrl, 'https://api.example.com');
 });
 
 test('saveSettings: writes under the documented storage key', () => {
