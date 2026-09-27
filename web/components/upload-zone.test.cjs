@@ -9,7 +9,8 @@ const assert = require('node:assert/strict');
 
 // ── Constants (mirrors WasmUpload.tsx) ───────────────────────────────────────
 
-const MAX_WASM_SIZE = 2 * 1024 * 1024; // 2 MB
+const MAX_WASM_SIZE_MB = 50;
+const MAX_WASM_SIZE = MAX_WASM_SIZE_MB * 1024 * 1024;
 const WASM_MAGIC    = 0x0061736d;       // \0asm
 
 // ── Pure validation helpers (mirrors upload-zone.tsx logic) ──────────────────
@@ -110,29 +111,27 @@ test('wasmValidator: rejects .txt file', () => {
 
 // ── validateWasm size-limit tests (Closes #675) ───────────────────────────────
 
-test('validateWasm: accepts valid .wasm under 2 MB', () => {
-  // 1 KB — well within limit
-  assert.equal(validateWasm('contract.wasm', 1024), null);
+test('validateWasm: accepts valid .wasm below 50 MB', () => {
+  assert.equal(validateWasm('contract.wasm', MAX_WASM_SIZE - 1), null);
 });
 
-test('validateWasm: accepts .wasm at exactly 2 MB boundary', () => {
+test('validateWasm: accepts .wasm at exactly 50 MB boundary', () => {
   assert.equal(validateWasm('contract.wasm', MAX_WASM_SIZE), null);
 });
 
-test('validateWasm: rejects .wasm exceeding 2 MB limit', () => {
+test('validateWasm: rejects .wasm exceeding 50 MB limit', () => {
   const oversizeBytes = MAX_WASM_SIZE + 1;
   const error = validateWasm('big.wasm', oversizeBytes);
   assert.ok(error !== null, 'Expected an error for oversize file');
   assert.match(error, /too large/i);
-  assert.match(error, /2 MB limit/);
+  assert.match(error, /50 MB limit/);
 });
 
 test('validateWasm: error message includes actual file size in MB', () => {
-  const oversizeBytes = 3 * 1024 * 1024; // 3 MB
+  const oversizeBytes = 51 * 1024 * 1024;
   const error = validateWasm('fat.wasm', oversizeBytes);
   assert.ok(error !== null);
-  // Should mention the actual size (3.00 MB)
-  assert.match(error, /3\.00 MB/);
+  assert.match(error, /51\.00 MB/);
 });
 
 test('validateWasm: rejects empty file', () => {
@@ -196,8 +195,8 @@ test('validateWasmBuffer: rejects unsupported version 0', () => {
 // ── Combined guard: size check must happen BEFORE magic check ─────────────────
 
 test('size guard catches oversized file before magic-bytes check is reached', () => {
-  // A 3 MB buffer with correct magic bytes should be caught by size guard first
-  const oversizeBytes = 3 * 1024 * 1024;
+  // A 51 MB buffer with correct magic bytes should be caught by size guard first
+  const oversizeBytes = 51 * 1024 * 1024;
   const error = validateWasm('large_valid.wasm', oversizeBytes);
   assert.ok(error !== null, 'size guard should fire');
   assert.match(error, /too large/i);
@@ -235,9 +234,9 @@ test('onDropRejected: builds correct error message for non-wasm file', () => {
 
 // ── MAX_WASM_SIZE constant verification ───────────────────────────────────────
 
-test('MAX_WASM_SIZE constant equals exactly 2 MB (2097152 bytes)', () => {
-  assert.equal(MAX_WASM_SIZE, 2 * 1024 * 1024);
-  assert.equal(MAX_WASM_SIZE, 2097152);
+test('MAX_WASM_SIZE constant equals exactly 50 MB', () => {
+  assert.equal(MAX_WASM_SIZE_MB, 50);
+  assert.equal(MAX_WASM_SIZE, 50 * 1024 * 1024);
 });
 
 test('WASM_MAGIC constant matches \\0asm bytes', () => {
