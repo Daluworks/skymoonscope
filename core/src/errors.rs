@@ -8,6 +8,7 @@ use thiserror::Error;
 use utoipa::ToSchema;
 use tracing::error;
 
+use crate::comparison::ComparisonError;
 use crate::simulation::SimulationError;
 
 #[derive(Error, Debug)]
@@ -188,6 +189,23 @@ impl From<SimulationError> for AppError {
             SimulationError::ConsensusMismatch(msg) => {
                 AppError::Internal(format!("Consensus mismatch: {}", msg))
             }
+        }
+    }
+}
+
+/// Convert a [`ComparisonError`] to an [`AppError`].
+///
+/// A missing baseline snapshot is a client-visible "not found" condition — the
+/// caller asked to diff against a snapshot that does not exist — so it maps to
+/// [`AppError::NotFound`] (HTTP 404) rather than a generic 500. Simulation
+/// failures delegate to the existing [`SimulationError`] mapping.
+impl From<ComparisonError> for AppError {
+    fn from(err: ComparisonError) -> Self {
+        match err {
+            ComparisonError::BaselineNotFound(snapshot_id) => {
+                AppError::NotFound(format!("Baseline snapshot not found: {}", snapshot_id))
+            }
+            ComparisonError::Simulation(inner) => AppError::from(inner),
         }
     }
 }
