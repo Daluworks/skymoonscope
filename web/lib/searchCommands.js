@@ -151,6 +151,47 @@ function moveHighlight(current, delta, length) {
   return next < 0 ? next + length : next;
 }
 
+/** Prefix for the DOM ids the search listbox gives its options. */
+const SEARCH_OPTION_ID_PREFIX = 'global-search-option-';
+
+/**
+ * DOM id for a command's option element.
+ *
+ * The combobox points at the active option with `aria-activedescendant`, which
+ * needs a stable id per option. Command ids are not guaranteed to be valid ids
+ * ("fn:transfer_from"), so anything outside the safe set is folded to a dash,
+ * and a missing id folds to `unknown` rather than to a bare prefix.
+ */
+function optionIdFor(command) {
+  const raw = command && command.id != null ? String(command.id) : 'unknown';
+  const safe = raw.replace(/[^A-Za-z0-9_-]/g, '-') || 'unknown';
+  return `${SEARCH_OPTION_ID_PREFIX}${safe}`;
+}
+
+/**
+ * Clamp a stored highlight to a result list that may have shrunk since the
+ * highlight was set. Returns 0 for an empty list so callers can index safely.
+ */
+function normalizeHighlight(current, length) {
+  if (!Number.isFinite(length) || length <= 0) return 0;
+  if (!Number.isFinite(current) || current < 0) return 0;
+  const whole = Math.trunc(current);
+  return whole >= length ? length - 1 : whole;
+}
+
+/**
+ * Resolve a listbox navigation key to an index.
+ *
+ * `Home` and `End` jump to the ends; anything else keeps the clamped current
+ * position, so callers can pass any key without special-casing it first.
+ */
+function moveHighlightTo(key, current, length) {
+  if (!Number.isFinite(length) || length <= 0) return 0;
+  if (key === 'Home') return 0;
+  if (key === 'End') return length - 1;
+  return normalizeHighlight(current, length);
+}
+
 module.exports = {
   BASE_COMMANDS,
   isSearchShortcut,
@@ -159,4 +200,8 @@ module.exports = {
   filterCommands,
   buildCommandRegistry,
   moveHighlight,
+  moveHighlightTo,
+  normalizeHighlight,
+  optionIdFor,
+  SEARCH_OPTION_ID_PREFIX,
 };

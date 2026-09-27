@@ -10,6 +10,9 @@ import {
   isDismissShortcut,
   isSearchShortcut,
   moveHighlight,
+  moveHighlightTo,
+  normalizeHighlight,
+  optionIdFor,
 } from '../lib/searchCommands';
 import type { SearchCommand } from '../lib/searchCommands';
 import { MOCK_CONTRACT_FUNCTIONS } from '../lib/sorobantypes';
@@ -25,6 +28,11 @@ export const SEARCH_COMMAND_EVENT = 'sky-moon-scope:search-command';
  *
  * Mounted once in `_app`, so Cmd+K / Ctrl+K works on every page without moving
  * the mouse to the header.
+ *
+ * Keyboard navigation follows the ARIA combobox + listbox pattern: the input
+ * owns focus, and the highlighted option is exposed with
+ * `aria-activedescendant` rather than by moving DOM focus, so screen readers
+ * announce the active result as the arrow keys move through it.
  */
 export function GlobalSearchModal() {
   const router = useRouter();
@@ -32,12 +40,19 @@ export function GlobalSearchModal() {
   const [query, setQuery] = useState('');
   const [highlight, setHighlight] = useState(0);
   const inputRef = useRef<HTMLInputElement>(null);
+  const listRef = useRef<HTMLUListElement>(null);
 
   const commands = useMemo(
     () => buildCommandRegistry({ functions: MOCK_CONTRACT_FUNCTIONS }),
     [],
   );
   const results = useMemo(() => filterCommands(commands, query), [commands, query]);
+
+  // The list shrinks as the query narrows, so the stored index can outlive the
+  // option it pointed at. Everything reads the clamped value, which keeps
+  // `aria-activedescendant` from naming an option that is no longer rendered.
+  const activeIndex = normalizeHighlight(highlight, results.length);
+  const activeOptionId = results.length > 0 ? optionIdFor(results[activeIndex]) : undefined;
 
   const close = useCallback(() => {
     setOpen(false);
@@ -78,7 +93,7 @@ export function GlobalSearchModal() {
         setOpen((prev) => !prev);
         return;
       }
-      
+
       // Handle dismiss shortcut (Escape) — only if modal is open
       if (isDismissShortcut(event) && open) {
         event.preventDefault();
@@ -87,7 +102,7 @@ export function GlobalSearchModal() {
     };
 
     window.addEventListener('keydown', handleKeyDown);
-    
+
     // Cleanup: Remove listener when component unmounts or dependencies change
     return () => {
       window.removeEventListener('keydown', handleKeyDown);
@@ -113,18 +128,31 @@ export function GlobalSearchModal() {
     setHighlight(0);
   }, [query]);
 
+  // Keep the active option on screen. The list scrolls (max-h-80), so without
+  // this the highlight walks off the bottom and a keyboard-only user is
+  // selecting something they cannot see.
+  useEffect(() => {
+    if (!open) return;
+    const active = listRef.current?.querySelector('[data-active="true"]');
+    active?.scrollIntoView({ block: 'nearest' });
+  }, [open, activeIndex, results.length]);
+
   if (!open) return null;
 
   const handleInputKeyDown = (event: React.KeyboardEvent<HTMLInputElement>) => {
     if (event.key === 'ArrowDown') {
       event.preventDefault();
-      setHighlight((current) => moveHighlight(current, 1, results.length));
+      setHighlight(moveHighlight(activeIndex, 1, results.length));
     } else if (event.key === 'ArrowUp') {
       event.preventDefault();
-      setHighlight((current) => moveHighlight(current, -1, results.length));
+      setHighlight(moveHighlight(activeIndex, -1, results.length));
+    } else if (event.key === 'Home' || event.key === 'End') {
+      // First/last result, per the listbox keyboard interaction pattern.
+      event.preventDefault();
+      setHighlight(moveHighlightTo(event.key, activeIndex, results.length));
     } else if (event.key === 'Enter') {
       event.preventDefault();
-      runCommand(results[highlight]);
+      runCommand(results[activeIndex]);
     }
   };
 
@@ -150,6 +178,7 @@ export function GlobalSearchModal() {
             role="combobox"
             aria-expanded="true"
             aria-controls="global-search-results"
+            aria-activedescendant={activeOptionId}
             aria-autocomplete="list"
             placeholder="Search pages, functions and settings..."
             value={query}
@@ -167,7 +196,13 @@ export function GlobalSearchModal() {
           </button>
         </div>
 
-        <ul id="global-search-results" role="listbox" className="max-h-80 overflow-y-auto py-2">
+        <ul
+          ref={listRef}
+          id="global-search-results"
+          role="listbox"
+          aria-label="Search results"
+          className="max-h-80 overflow-y-auto py-2"
+        >
           {results.length === 0 && (
             <li className="px-4 py-6 text-center text-sm text-slate-500">
               No matches for &ldquo;{query}&rdquo;
@@ -175,19 +210,26 @@ export function GlobalSearchModal() {
           )}
 
           {results.map((command, index) => (
-            <li key={command.id} role="option" aria-selected={index === highlight}>
+            <li
+              key={command.id}
+              id={optionIdFor(command)}
+              role="option"
+              aria-selected={index === activeIndex}
+              data-active={index === activeIndex ? 'true' : 'false'}
+            >
               <button
                 type="button"
+                tabIndex={-1}
                 onMouseEnter={() => setHighlight(index)}
                 onClick={() => runCommand(command)}
                 className={`flex w-full items-center justify-between gap-3 px-4 py-2.5 text-left transition-colors ${
-                  index === highlight ? 'bg-cyan-500/10' : 'hover:bg-slate-800/60'
+                  index === activeIndex ? 'bg-cyan-500/10' : 'hover:bg-slate-800/60'
                 }`}
               >
                 <span className="min-w-0">
                   <span
                     className={`block truncate text-sm font-medium ${
-                      index === highlight ? 'text-cyan-300' : 'text-slate-200'
+                      index === activeIndex ? 'text-cyan-300' : 'text-slate-200'
                     }`}
                   >
                     {command.title}
