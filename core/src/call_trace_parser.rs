@@ -20,6 +20,7 @@ use base64::{engine::general_purpose::STANDARD as BASE64, Engine as _};
 use serde::{Deserialize, Serialize};
 use soroban_sdk::xdr::{DiagnosticEvent, Hash, Limits, ReadXdr, ScVal};
 use stellar_strkey::{Contract as StrkeyContract, Strkey};
+use tracing::{debug, debug_span, error, instrument};
 
 // ─────────────────────────────────────────────────────────────────────────────
 // Public types
@@ -70,8 +71,9 @@ impl CallGraph {
 /// found.
 ///
 /// Events that cannot be decoded or do not match the expected schema are
-/// silently skipped so that partial or future-format event streams degrade
-/// gracefully.
+/// logged at `debug` level and skipped so that partial or future-format
+/// event streams degrade gracefully.
+#[instrument(name = "call_trace_parser", skip(events), fields(event_count = events.len()))]
 pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
     let mut stack: Vec<CallNode> = Vec::new();
     let mut root: Option<CallNode> = None;
@@ -79,12 +81,18 @@ pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
     for event_b64 in events {
         let bytes = match BASE64.decode(event_b64) {
             Ok(b) => b,
-            Err(_) => continue,
+            Err(err) => {
+                debug!(error = ?err, "Skipping call trace event: invalid base64 payload");
+                continue;
+            }
         };
 
         let diag_event = match DiagnosticEvent::from_xdr(&bytes, Limits::none()) {
             Ok(e) => e,
-            Err(_) => continue,
+            Err(err) => {
+                debug!(error = ?err, "Skipping call trace event: undecodable diagnostic event");
+                continue;
+            }
         };
 
         // Only process events from successful contract calls.
@@ -116,6 +124,13 @@ pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
                     ScVal::Symbol(s) => s.to_string(),
                     _ => "unknown".to_string(),
                 };
+                let span = debug_span!(
+                    "fn_call",
+                    contract_id = %contract_id,
+                    function = %function
+                );
+                let _entered = span.enter();
+                debug!(depth = stack.len() + 1, "Entering contract function call");
                 stack.push(CallNode {
                     contract_id,
                     function,
@@ -124,11 +139,27 @@ pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
             }
             "fn_return" => {
                 if let Some(finished_node) = stack.pop() {
+                    let span = debug_span!(
+                        "fn_return",
+                        contract_id = %finished_node.contract_id,
+                        function = %finished_node.function
+                    );
+                    let _entered = span.enter();
+                    let depth = stack.len() + 1;
                     if let Some(parent) = stack.last_mut() {
+                        debug!(
+                            depth,
+                            caller_contract_id = %parent.contract_id,
+                            caller_function = %parent.function,
+                            "Returning from contract function call"
+                        );
                         parent.children.push(finished_node);
                     } else {
+                        debug!(depth, "Returning from outermost contract call");
                         root = Some(finished_node);
                     }
+                } else {
+                    error!("Received fn_return event without a matching fn_call");
                 }
             }
             _ => {}
@@ -139,6 +170,11 @@ pub fn parse_call_trace(events: &[String]) -> Option<CallGraph> {
     // If there is exactly one remaining node and no root yet, use it.
     if root.is_none() {
         if let Some(node) = stack.into_iter().next() {
+            debug!(
+                contract_id = %node.contract_id,
+                function = %node.function,
+                "Flushing unterminated call as the trace root"
+            );
             root = Some(node);
         }
     }

@@ -34,9 +34,38 @@ impl ContractRegister {
         }
     }
 
+    /// Register a single contract in the whitelist, rejecting a duplicate
+    /// `contract_id` with a [`ContractRegistryError::Conflict`] instead of
+    /// silently overwriting the prior entry.
+    ///
+    /// This is the in-memory analogue of `INSERT ... ON CONFLICT DO NOTHING
+    /// RETURNING id`: registration is idempotent-safe for new ids and reports
+    /// an explicit conflict when the same contract id is registered twice.
+    pub fn register(
+        &mut self,
+        contract_id: impl Into<String>,
+        wasm_hash: impl Into<String>,
+    ) -> Result<(), ContractRegistryError> {
+        let contract_id = contract_id.into();
+
+        if self.entries.contains_key(&contract_id) {
+            return Err(ContractRegistryError::Conflict {
+                contract_id: contract_id.clone(),
+                existing_hash: self.entries.get(&contract_id).cloned().unwrap_or_default(),
+            });
+        }
+        self.entries
+            .insert(contract_id, wasm_hash.into().to_lowercase());
+        Ok(())
+    }
+
     /// Parse a whitelist from a JSON array of `{"contract_id", "wasm_hash"}`
     /// entries, e.g. the `VERIFIED_CONTRACTS` environment variable. An empty
     /// or absent value yields an empty (deny-all) register.
+    ///
+    /// A `contract_id` appearing more than once is rejected with a
+    /// [`ContractRegistryError::Conflict`] rather than silently keeping the
+    /// last entry.
     pub fn from_json(json: &str) -> Result<Self, ContractRegistryError> {
         let trimmed = json.trim();
         if trimmed.is_empty() {
@@ -45,12 +74,12 @@ impl ContractRegister {
 
         let entries: Vec<ContractRegisterEntry> = serde_json::from_str(trimmed)
             .map_err(|e| ContractRegistryError::InvalidWhitelist(e.to_string()))?;
-        Ok(Self::new(
-            entries
-                .into_iter()
-                .map(|entry| (entry.contract_id, entry.wasm_hash))
-                .collect(),
-        ))
+
+        let mut register = Self::default();
+        for entry in entries {
+            register.register(entry.contract_id, entry.wasm_hash)?;
+        }
+        Ok(register)
     }
 
     pub fn expected_hash(&self, contract_id: &str) -> Option<&str> {
@@ -80,6 +109,14 @@ pub enum ContractRegistryError {
         contract_id: String,
         expected: String,
         actual: String,
+    },
+    /// The contract id was already present in the register when a duplicate
+    /// registration was attempted. HTTP callers should surface this as
+    /// `409 Conflict`.
+    #[error("conflict: contract {contract_id} is already registered with hash {existing_hash}")]
+    Conflict {
+        contract_id: String,
+        existing_hash: String,
     },
     #[error("failed to fetch contract bytecode: {0}")]
     Source(String),
@@ -222,5 +259,56 @@ mod tests {
     #[test]
     fn from_json_rejects_malformed_input() {
         assert!(ContractRegister::from_json("not json").is_err());
+    }
+
+    #[test]
+    fn from_json_rejects_duplicate_contract_ids_with_a_conflict() {
+        let json = r#"[
+            {"contract_id":"CDUP","wasm_hash":"deadbeef"},
+            {"contract_id":"CDUP","wasm_hash":"cafebabe"}
+        ]"#;
+        let err = ContractRegister::from_json(json).unwrap_err();
+        assert!(
+            matches!(
+                &err,
+                ContractRegistryError::Conflict {
+                    contract_id,
+                    existing_hash
+                } if contract_id == "CDUP" && existing_hash == "deadbeef"
+            ),
+            "expected a conflict naming the duplicate contract id, got {err}"
+        );
+    }
+
+    #[test]
+    fn from_json_keeps_distinct_contract_ids() {
+        let json = r#"[
+            {"contract_id":"CA","wasm_hash":"deadbeef"},
+            {"contract_id":"CB","wasm_hash":"cafebabe"}
+        ]"#;
+        let registry = ContractRegister::from_json(json).expect("distinct ids are valid");
+        assert_eq!(registry.len(), 2);
+        assert_eq!(registry.expected_hash("CA"), Some("deadbeef"));
+        assert_eq!(registry.expected_hash("CB"), Some("cafebabe"));
+    }
+
+    #[test]
+    fn register_rejects_a_duplicate_contract_id_with_a_conflict() {
+        let mut registry =
+            ContractRegister::new(HashMap::from([("C1".to_string(), "deadbeef".to_string())]));
+
+        assert!(registry.register("C1", "cafebabe").is_err());
+        // The original entry must not have been overwritten.
+        assert_eq!(registry.expected_hash("C1"), Some("deadbeef"));
+    }
+
+    #[test]
+    fn register_accepts_a_new_contract_and_lowercases_its_hash() {
+        let mut registry = ContractRegister::default();
+        registry
+            .register("C2", "CAFEBABE")
+            .expect("new contract id registers");
+        assert_eq!(registry.len(), 1);
+        assert_eq!(registry.expected_hash("C2"), Some("cafebabe"));
     }
 }

@@ -377,9 +377,10 @@ impl AlertDeduper {
 /// for downstream scrapers / pagers.
 #[derive(Debug, Clone, Serialize)]
 pub struct SysAlarmEvent {
-    /// Either `"threshold_breach"` or `"threshold_recovered"`.
+    /// Alarm kind, e.g. `"threshold_breach"`, `"threshold_recovered"`,
+    /// or a subsystem-specific name such as `"fee_store_write_failed"`.
     pub event: &'static str,
-    /// Either `"cpu"` or `"memory"`.
+    /// Emitting subsystem, e.g. `"cpu"`, `"memory"`, or `"fee_collector"`.
     pub resource: &'static str,
     pub value_percent: f64,
     pub threshold_percent: f64,
@@ -608,29 +609,42 @@ impl SysAlarmMonitor {
             timestamp: chrono::Utc::now(),
         };
 
-        let Some(url) = self.config.webhook_url.as_deref() else {
+        emit_sys_alarm(self.config.webhook_url.as_deref(), &payload).await;
+    }
+}
+
+/// POST a [`SysAlarmEvent`] to the configured webhook, using the same
+/// transport contract as [`SysAlarmMonitor`], and degrade to log-only
+/// when no webhook URL is configured.
+///
+/// Factored out of [`SysAlarmMonitor::fire_alert`] so non-resource
+/// subsystems — for example the fee collector's bounded-retry
+/// dead-letter path — can raise alarms through the exact same
+/// [`SysAlarmConfig`] / webhook machinery instead of standing up a
+/// second monitor or a parallel alert channel.
+pub async fn emit_sys_alarm(webhook_url: Option<&str>, payload: &SysAlarmEvent) {
+    let Some(url) = webhook_url else {
+        return;
+    };
+
+    let client = match Client::builder().timeout(WEBHOOK_TIMEOUT).build() {
+        Ok(client) => client,
+        Err(err) => {
+            warn!(error = %err, "Failed to construct HTTP client for sysalarm webhook");
             return;
-        };
+        }
+    };
 
-        let client = match Client::builder().timeout(WEBHOOK_TIMEOUT).build() {
-            Ok(client) => client,
-            Err(err) => {
-                warn!(error = %err, "Failed to construct HTTP client for sysalarm webhook");
-                return;
-            }
-        };
-
-        match client.post(url).json(&payload).send().await {
-            Ok(response) if response.status().is_success() => {}
-            Ok(response) => {
-                warn!(
-                    status = response.status().as_u16(),
-                    url, "Sysalarm webhook returned non-success status"
-                );
-            }
-            Err(err) => {
-                warn!(error = %err, url, "Failed to POST sysalarm webhook");
-            }
+    match client.post(url).json(payload).send().await {
+        Ok(response) if response.status().is_success() => {}
+        Ok(response) => {
+            warn!(
+                status = response.status().as_u16(),
+                url, "Sysalarm webhook returned non-success status"
+            );
+        }
+        Err(err) => {
+            warn!(error = %err, url, "Failed to POST sysalarm webhook");
         }
     }
 }
@@ -1034,5 +1048,24 @@ mod tests {
         std::env::remove_var(ENV_WEBHOOK);
         let cfg = SysAlarmConfig::from_env();
         assert!(cfg.webhook_url.is_none());
+    }
+
+    #[tokio::test]
+    async fn emit_sys_alarm_without_webhook_is_a_noop() {
+        let payload = SysAlarmEvent {
+            event: "fee_store_write_failed",
+            resource: "fee_collector",
+            value_percent: 5.0,
+            threshold_percent: 5.0,
+            process_memory_bytes: 3,
+            total_memory_bytes: 256,
+            pid: std::process::id(),
+            node_id: None,
+            timestamp: chrono::DateTime::from_timestamp(0, 0).unwrap(),
+        };
+
+        // No URL configured: the helper must return without attempting a
+        // network call (and without panicking).
+        emit_sys_alarm(None, &payload).await;
     }
 }

@@ -7,7 +7,7 @@
     "build": "next build",
     "start": "next start",
     "lint": "eslint . --ext .ts,.tsx,.js,.jsx",
-    "test": "node --test lib/__tests__/*.test.js components/**/*.test.cjs",
+    "test": "node --test lib/__tests__/*.test.js lib/userSettings.test.cjs components/**/*.test.cjs",
     "security:audit": "npm audit --audit-level=high",
     "security:audit:fix": "npm audit fix",
     "security:check": "npm run security:audit"
