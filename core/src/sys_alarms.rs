@@ -22,9 +22,15 @@
 //!   `host_cpu_usage_percent`, `host_memory_usage_percent`, and
 //!   `process_memory_bytes` gauges that are owned by the consumer's
 //!   [`AppMetrics`] instance.
+//! * **Rate limited** — a resource that oscillates around the threshold
+//!   produces an edge transition on every sample. [`AlertDeduper`] collapses
+//!   those into at most one alert per resource per `dedup_window` (issue #24),
+//!   so on-call is never paged once per sampling interval.
 //!
 //! Configuration is read from environment variables via
-//! [`SysAlarmConfig::from_env`]:
+//! [`SysAlarmConfig::from_env`], and the deduplication window can also be
+//! supplied by the application config as `alarm_dedup_window_secs` (see
+//! [`SysAlarmConfig::with_dedup_window_secs`]):
 //!
 //! | Env var                                | Default | Purpose                                |
 //! |----------------------------------------|---------|----------------------------------------|
@@ -32,19 +38,23 @@
 //! | `Sky Moon Scope_ALARM_INTERVAL_SECS`        | `10`    | Sampling cadence.                      |
 //! | `Sky Moon Scope_ALARM_WEBHOOK_URL`          | unset   | POST target for breach/recovery events.|
 //! | `Sky Moon Scope_ALARM_DISABLE`              | `false` | Set `1`/`true` to disable entirely.    |
+//! | `ALARM_DEDUP_WINDOW_SECS`                   | `60`    | Minimum seconds between two alerts for the same resource. `0` disables rate limiting. |
 
 use crate::AppMetrics;
 use reqwest::Client;
 use serde::Serialize;
+use std::collections::HashMap;
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 use sysinfo::{Pid, System};
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 /// Default alarm threshold, matching the spec from issue #592.
 pub const DEFAULT_THRESHOLD_PERCENT: f64 = 85.0;
 /// Default sampling interval in seconds.
 pub const DEFAULT_INTERVAL_SECS: u64 = 10;
+/// Default deduplication window in seconds (issue #24).
+pub const DEFAULT_DEDUP_WINDOW_SECS: u64 = 60;
 
 /// Maximum HTTP time for a single webhook POST before we abandon it.
 const WEBHOOK_TIMEOUT: Duration = Duration::from_secs(5);
@@ -56,6 +66,17 @@ pub const ENV_INTERVAL: &str = "Sky Moon Scope_ALARM_INTERVAL_SECS";
 pub const ENV_WEBHOOK: &str = "Sky Moon Scope_ALARM_WEBHOOK_URL";
 pub const ENV_DISABLE: &str = "Sky Moon Scope_ALARM_DISABLE";
 pub const ENV_INSTANCE_ID: &str = "Sky Moon Scope_INSTANCE_ID";
+/// Deduplication window. This is the same environment variable the
+/// application config maps to `alarm_dedup_window_secs`, so both entry points
+/// (this module's [`SysAlarmConfig::from_env`] and
+/// [`SysAlarmConfig::with_dedup_window_secs`] driven from `Config`) agree on
+/// one name and one default.
+pub const ENV_DEDUP_WINDOW: &str = "ALARM_DEDUP_WINDOW_SECS";
+
+/// Resource names used as deduplication keys. Kept as constants so the
+/// evaluator, the deduper and the webhook payload cannot drift apart.
+pub const RESOURCE_CPU: &str = "cpu";
+pub const RESOURCE_MEMORY: &str = "memory";
 
 /// Confguration for the alarm monitor.
 #[derive(Debug, Clone)]
@@ -68,6 +89,9 @@ pub struct SysAlarmConfig {
     pub webhook_url: Option<String>,
     /// Master switch — `false` short-circuits [`SysAlarmMonitor::spawn`].
     pub enabled: bool,
+    /// Minimum time between two alerts for the same resource. `Duration::ZERO`
+    /// disables rate limiting, so every edge transition is reported.
+    pub dedup_window: Duration,
 }
 
 impl Default for SysAlarmConfig {
@@ -77,11 +101,31 @@ impl Default for SysAlarmConfig {
             interval: Duration::from_secs(DEFAULT_INTERVAL_SECS),
             webhook_url: None,
             enabled: true,
+            dedup_window: Duration::from_secs(DEFAULT_DEDUP_WINDOW_SECS),
         }
     }
 }
 
 impl SysAlarmConfig {
+    /// Override the alert deduplication window with the value resolved by the
+    /// application config (`alarm_dedup_window_secs`).
+    ///
+    /// The alarm manager is initialised from this configuration, so the window
+    /// is adjustable per deployment without recompiling — the reason issue #24
+    /// exists: a hardcoded window is either too short (alert storms while a
+    /// resource flaps around the threshold) or too long (recovery alerts are
+    /// swallowed).
+    pub fn with_dedup_window(mut self, window: Duration) -> Self {
+        self.dedup_window = window;
+        self
+    }
+
+    /// Same as [`Self::with_dedup_window`] but takes whole seconds, matching
+    /// the `alarm_dedup_window_secs` config key.
+    pub fn with_dedup_window_secs(mut self, window_secs: u64) -> Self {
+        self.with_dedup_window(Duration::from_secs(window_secs))
+    }
+
     /// Construct from defaults and overlay environment variables.
     /// Out-of-range or unparseable env values are logged and ignored,
     /// keeping current defaults reachable from misconfigured
@@ -114,6 +158,26 @@ impl SysAlarmConfig {
                 "1" | "true" | "yes" | "on"
             );
             self.enabled = !disabled;
+        }
+        if let Ok(raw) = std::env::var(ENV_DEDUP_WINDOW) {
+            self.set_dedup_window_secs_from_str(&raw);
+        }
+    }
+
+    /// Overlay the deduplication window from its environment variable.
+    ///
+    /// Unlike the threshold and the interval there is no lower bound to
+    /// enforce: `0` is a valid, meaningful value that switches rate limiting
+    /// off, and any non-negative integer is accepted. Only values that are not
+    /// a `u64` are rejected, leaving the current setting in place.
+    fn set_dedup_window_secs_from_str(&mut self, raw: &str) {
+        match raw.trim().parse::<u64>() {
+            Ok(value) => self.dedup_window = Duration::from_secs(value),
+            Err(_) => warn!(
+                value = raw,
+                env = %ENV_DEDUP_WINDOW,
+                "Ignoring dedup window: must be a non-negative integer number of seconds"
+            ),
         }
     }
 
@@ -248,15 +312,69 @@ impl SysAlarmEvaluator {
     }
 }
 
-/// JSON payload posted to the webhook on threshold / subsystem events.
-/// Kept stable for downstream scrapers / pagers.
+/// Rate limiter that keeps a flapping resource from paging on every sample.
 ///
-/// Host-resource monitors set `resource` to `"cpu"`/`"memory"` and
-/// `event` to `"threshold_breach"`/`"threshold_recovered"`. Other
-/// subsystems reuse the same envelope through [`emit_sys_alarm`]; for
-/// example the fee collector's dead-letter path emits
-/// `resource = "fee_collector"` with `value_percent` / `threshold_percent`
-/// carrying the consecutive-failure count and the configured threshold.
+/// [`SysAlarmEvaluator`] is edge-triggered, so a resource oscillating around
+/// the threshold emits a `Triggered`/`Resolved` pair every sampling interval.
+/// The deduper turns those into at most one alert per resource per window.
+///
+/// Suppression is applied to breach *and* recovery events on purpose: the
+/// point of the window is to guarantee a maximum page rate per resource, and
+/// forwarding recoveries while dropping breaches would still flood the
+/// channel. The evaluator state itself is not affected, so the next event
+/// after the window reflects the real edge that was crossed.
+///
+/// Deliberately allocation-free apart from one map entry per resource and
+/// free of any tokio or clock dependency — the caller supplies `now`, which
+/// keeps it unit-testable without a runtime.
+#[derive(Debug, Default)]
+pub struct AlertDeduper {
+    /// Last time an alert was emitted for a resource.
+    last_emitted: HashMap<&'static str, Instant>,
+}
+
+impl AlertDeduper {
+    pub fn new() -> Self {
+        Self::default()
+    }
+
+    /// Returns `true` when an alert for `resource` should be emitted at `now`,
+    /// recording the emission so repeats inside `window` are suppressed.
+    ///
+    /// A zero-length window disables rate limiting entirely.
+    pub fn should_emit(&mut self, resource: &'static str, now: Instant, window: Duration) -> bool {
+        if window.is_zero() {
+            self.last_emitted.insert(resource, now);
+            return true;
+        }
+
+        match self.last_emitted.get(resource) {
+            Some(last) if now.saturating_duration_since(*last) < window => false,
+            _ => {
+                self.last_emitted.insert(resource, now);
+                true
+            }
+        }
+    }
+
+    /// Time left before `resource` may alert again, or `None` when it is not
+    /// currently throttled.
+    pub fn remaining(
+        &self,
+        resource: &'static str,
+        now: Instant,
+        window: Duration,
+    ) -> Option<Duration> {
+        if window.is_zero() {
+            return None;
+        }
+        let last = self.last_emitted.get(resource)?;
+        window.checked_sub(now.saturating_duration_since(*last))
+    }
+}
+
+/// JSON payload posted to the webhook on threshold events. Kept stable
+/// for downstream scrapers / pagers.
 #[derive(Debug, Clone, Serialize)]
 pub struct SysAlarmEvent {
     /// Alarm kind, e.g. `"threshold_breach"`, `"threshold_recovered"`,
@@ -313,6 +431,7 @@ impl SysAlarmMonitor {
         info!(
             threshold_percent = self.config.threshold_percent,
             interval_secs = self.config.interval.as_secs(),
+            dedup_window_secs = self.config.dedup_window.as_secs(),
             webhook_enabled = self.config.webhook_url.is_some(),
             pid = std::process::id(),
             "SysAlarmMonitor starting"
@@ -338,6 +457,9 @@ impl SysAlarmMonitor {
             .filter(|s| !s.trim().is_empty());
 
         let mut evaluator = SysAlarmEvaluator::new();
+        // Issue #24: rate limit alerts per resource so a resource oscillating
+        // around the threshold cannot page on every sample.
+        let mut deduper = AlertDeduper::new();
         let mut interval = tokio::time::interval(self.config.interval);
         // `tokio::time::interval` fires its first tick immediately
         // which leaves no time for sysinfo to compute a CPU usage
@@ -395,29 +517,45 @@ impl SysAlarmMonitor {
             if evaluator.observe_cpu(cpu_percent, self.config.threshold_percent)
                 != Transition::NoChange
             {
-                self.fire_alert(
-                    "cpu",
-                    cpu_percent,
-                    evaluator.is_cpu_above(),
-                    process_memory_bytes,
-                    total_memory,
-                    node_id.as_deref(),
-                )
-                .await;
+                if deduper.should_emit(RESOURCE_CPU, Instant::now(), self.config.dedup_window) {
+                    self.fire_alert(
+                        "cpu",
+                        cpu_percent,
+                        evaluator.is_cpu_above(),
+                        process_memory_bytes,
+                        total_memory,
+                        node_id.as_deref(),
+                    )
+                    .await;
+                } else {
+                    debug!(
+                        resource = RESOURCE_CPU,
+                        window_secs = self.config.dedup_window.as_secs(),
+                        "Suppressing duplicate cpu alarm inside dedup window"
+                    );
+                }
             }
 
             if evaluator.observe_memory(mem_percent, self.config.threshold_percent)
                 != Transition::NoChange
             {
-                self.fire_alert(
-                    "memory",
-                    mem_percent,
-                    evaluator.is_memory_above(),
-                    process_memory_bytes,
-                    total_memory,
-                    node_id.as_deref(),
-                )
-                .await;
+                if deduper.should_emit(RESOURCE_MEMORY, Instant::now(), self.config.dedup_window) {
+                    self.fire_alert(
+                        "memory",
+                        mem_percent,
+                        evaluator.is_memory_above(),
+                        process_memory_bytes,
+                        total_memory,
+                        node_id.as_deref(),
+                    )
+                    .await;
+                } else {
+                    debug!(
+                        resource = RESOURCE_MEMORY,
+                        window_secs = self.config.dedup_window.as_secs(),
+                        "Suppressing duplicate memory alarm inside dedup window"
+                    );
+                }
             }
 
             interval.tick().await;
@@ -523,6 +661,109 @@ mod tests {
         assert_eq!(cfg.interval, Duration::from_secs(DEFAULT_INTERVAL_SECS));
         assert!(cfg.enabled);
         assert!(cfg.webhook_url.is_none());
+        // Issue #24: the deduplication window is measured in seconds, not
+        // hardcoded inside the sampling loop.
+        assert_eq!(
+            cfg.dedup_window,
+            Duration::from_secs(DEFAULT_DEDUP_WINDOW_SECS)
+        );
+    }
+
+    // ── Alert deduplication window (issue #24) ─────────────────────────────
+
+    #[test]
+    fn dedup_window_builder_overrides_the_default() {
+        let cfg = SysAlarmConfig::default().with_dedup_window_secs(5);
+        assert_eq!(cfg.dedup_window, Duration::from_secs(5));
+
+        let cfg = cfg.with_dedup_window(Duration::from_millis(250));
+        assert_eq!(cfg.dedup_window, Duration::from_millis(250));
+    }
+
+    #[test]
+    fn alert_deduper_emits_the_first_event_for_a_resource() {
+        let mut deduper = AlertDeduper::new();
+        let now = Instant::now();
+        assert!(deduper.should_emit(RESOURCE_CPU, now, Duration::from_secs(60)));
+    }
+
+    #[test]
+    fn alert_deduper_suppresses_repeats_inside_the_window() {
+        let mut deduper = AlertDeduper::new();
+        let window = Duration::from_secs(60);
+        let start = Instant::now();
+
+        assert!(deduper.should_emit(RESOURCE_CPU, start, window));
+        // A resource flapping around the threshold emits an edge transition
+        // every sample; only the first one inside the window is reported.
+        for elapsed in [10u64, 30, 59] {
+            assert!(!deduper.should_emit(
+                RESOURCE_CPU,
+                start + Duration::from_secs(elapsed),
+                window
+            ));
+        }
+    }
+
+    #[test]
+    fn alert_deduper_emits_again_once_the_window_elapsed() {
+        let mut deduper = AlertDeduper::new();
+        let window = Duration::from_secs(60);
+        let start = Instant::now();
+
+        assert!(deduper.should_emit(RESOURCE_MEMORY, start, window));
+        assert!(!deduper.should_emit(
+            RESOURCE_MEMORY,
+            start + Duration::from_secs(59),
+            window
+        ));
+        assert!(deduper.should_emit(
+            RESOURCE_MEMORY,
+            start + window,
+            window
+        ));
+    }
+
+    #[test]
+    fn alert_deduper_tracks_resources_independently() {
+        let mut deduper = AlertDeduper::new();
+        let window = Duration::from_secs(60);
+        let start = Instant::now();
+
+        assert!(deduper.should_emit(RESOURCE_CPU, start, window));
+        // A CPU alert must not silence the memory alarm.
+        assert!(deduper.should_emit(RESOURCE_MEMORY, start, window));
+        assert!(!deduper.should_emit(RESOURCE_CPU, start + Duration::from_secs(1), window));
+    }
+
+    #[test]
+    fn alert_deduper_zero_window_disables_rate_limiting() {
+        let mut deduper = AlertDeduper::new();
+        let start = Instant::now();
+
+        for _ in 0..5 {
+            assert!(deduper.should_emit(RESOURCE_CPU, start, Duration::ZERO));
+        }
+    }
+
+    #[test]
+    fn alert_deduper_remaining_reports_the_rest_of_the_window() {
+        let mut deduper = AlertDeduper::new();
+        let window = Duration::from_secs(60);
+        let start = Instant::now();
+
+        assert_eq!(deduper.remaining(RESOURCE_CPU, start, window), None);
+        assert!(deduper.should_emit(RESOURCE_CPU, start, window));
+        assert_eq!(
+            deduper.remaining(RESOURCE_CPU, start + Duration::from_secs(20), window),
+            Some(Duration::from_secs(40))
+        );
+        assert_eq!(
+            deduper.remaining(RESOURCE_CPU, start + window, window),
+            Some(Duration::ZERO)
+        );
+        // With rate limiting disabled nothing is ever throttled.
+        assert_eq!(deduper.remaining(RESOURCE_CPU, start, Duration::ZERO), None);
     }
 
     #[test]
@@ -686,6 +927,55 @@ mod tests {
             Some("https://example.test/hook")
         );
         assert!(cfg.enabled);
+    }
+
+    #[test]
+    fn config_from_env_reads_dedup_window() {
+        let _lock = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _restore = EnvRestore::capture(&[ENV_DEDUP_WINDOW]);
+
+        // Default when unset.
+        std::env::remove_var(ENV_DEDUP_WINDOW);
+        let cfg = SysAlarmConfig::from_env();
+        assert_eq!(
+            cfg.dedup_window,
+            Duration::from_secs(DEFAULT_DEDUP_WINDOW_SECS)
+        );
+
+        // Explicit override.
+        std::env::set_var(ENV_DEDUP_WINDOW, "15");
+        let cfg = SysAlarmConfig::from_env();
+        assert_eq!(cfg.dedup_window, Duration::from_secs(15));
+
+        // Zero is a supported value: it switches rate limiting off.
+        std::env::set_var(ENV_DEDUP_WINDOW, "0");
+        let cfg = SysAlarmConfig::from_env();
+        assert_eq!(cfg.dedup_window, Duration::ZERO);
+
+        // Garbage is rejected and the previous value survives.
+        std::env::set_var(ENV_DEDUP_WINDOW, "sixty");
+        let cfg = SysAlarmConfig::from_env();
+        assert_eq!(
+            cfg.dedup_window,
+            Duration::from_secs(DEFAULT_DEDUP_WINDOW_SECS)
+        );
+
+        std::env::set_var(ENV_DEDUP_WINDOW, "  ");
+        let cfg = SysAlarmConfig::from_env();
+        assert_eq!(
+            cfg.dedup_window,
+            Duration::from_secs(DEFAULT_DEDUP_WINDOW_SECS)
+        );
+    }
+
+    #[test]
+    fn dedup_window_can_be_set_in_place() {
+        let mut cfg = SysAlarmConfig::default();
+        cfg.set_dedup_window_secs_from_str(" 45 ");
+        assert_eq!(cfg.dedup_window, Duration::from_secs(45));
+
+        cfg.set_dedup_window_secs_from_str("nope");
+        assert_eq!(cfg.dedup_window, Duration::from_secs(45));
     }
 
     #[test]

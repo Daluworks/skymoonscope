@@ -191,6 +191,15 @@ struct AppConfig {
     /// When empty, defaults to `*` (allow all origins).
     #[serde(default = "default_allowed_origins")]
     allowed_origins: String,
+    /// Minimum number of seconds between two alerts for the same host
+    /// resource (issue #24).
+    ///
+    /// The system resource alarm monitor is edge-triggered, so without a
+    /// window a resource oscillating around the alarm threshold alerts on
+    /// every sampling interval. `0` disables rate limiting.
+    /// Env: `ALARM_DEDUP_WINDOW_SECS`. Default 60.
+    #[serde(default = "default_alarm_dedup_window_secs")]
+    alarm_dedup_window_secs: u64,
 }
 
 fn default_health_check_interval() -> u64 {
@@ -261,6 +270,16 @@ fn default_max_cache_size_mb() -> u64 {
 
 fn default_event_bus_capacity() -> usize {
     256
+}
+
+/// Default alert deduplication window in seconds (issue #24).
+///
+/// Mirrors `config::default_alarm_dedup_window_secs()` so the binary and the
+/// library config surface agree on a single default.
+fn default_alarm_dedup_window_secs() -> u64 {
+    60
+}
+
 fn default_allowed_origins() -> String {
     // Empty string means: fall back to allow-all (*).
     // Operators set ALLOWED_ORIGINS=http://localhost:3000,https://app.example.com
@@ -321,6 +340,12 @@ fn load_config() -> Result<AppConfig, ConfigError> {
         .set_default("max_cache_size_mb", 100)?
         .set_default("cors_allowed_origins", "")?
         .set_default("event_bus_capacity", 256)?
+        // Issue #24: alert deduplication window, resolved at alarm-manager
+        // initialisation below.
+        .set_default(
+            "alarm_dedup_window_secs",
+            default_alarm_dedup_window_secs(),
+        )?
         .set_default("log_format_json", false)?
         .set_default("allowed_origins", "")?
         .build()?;
@@ -2725,11 +2750,20 @@ async fn main() {
     // triggered hysteresis so a sustained saturation produces exactly
     // one breach notification (plus a recovery notification when the
     // resource drops back below threshold).
-    let alarm_config = crate::sys_alarms::SysAlarmConfig::from_env();
+    //
+    // Issue #24: the edge trigger fires on *every* crossing, so a resource
+    // flapping around the threshold would alert once per sample. The
+    // deduplication window (config: `alarm_dedup_window_secs`) caps that at
+    // one alert per resource per window.
+    let alarm_config = crate::sys_alarms::SysAlarmConfig::from_env()
+        .with_dedup_window_secs(config.alarm_dedup_window_secs);
     let alarm_monitor = crate::sys_alarms::SysAlarmMonitor::new(alarm_config)
         .with_metrics(Arc::clone(&app_metrics));
     if let Some(_alarm_handle) = alarm_monitor.spawn() {
-        tracing::info!("System resource alarm monitor spawned (issue #592)");
+        tracing::info!(
+            alarm_dedup_window_secs = config.alarm_dedup_window_secs,
+            "System resource alarm monitor spawned (issue #592)"
+        );
     }
     // Clone the bus Arc before app_state is moved into the router, so the gRPC
     // server can subscribe to the same broadcast channel.

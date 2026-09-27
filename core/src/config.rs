@@ -157,6 +157,15 @@ fn default_event_bus_capacity() -> usize {
     256
 }
 
+/// Default alert deduplication window, in seconds (issue #24).
+///
+/// One minute is long enough to absorb a resource flapping around the alarm
+/// threshold at the default 10 s sampling cadence, and short enough that a
+/// genuinely new breach is still reported promptly.
+fn default_alarm_dedup_window_secs() -> u64 {
+    60
+}
+
 fn default_log_format_json() -> bool {
     false
 }
@@ -362,6 +371,18 @@ pub struct AppConfig {
     #[serde(default = "default_event_bus_capacity")]
     pub event_bus_capacity: usize,
 
+    // --- System resource alarms ---
+
+    /// Minimum number of seconds between two alerts for the same resource.
+    ///
+    /// The host CPU/RAM alarm monitor is edge-triggered, so without a window a
+    /// resource oscillating around the alarm threshold emits an alert on every
+    /// sampling interval. Set to `0` to disable rate limiting and report every
+    /// edge transition.
+    /// Env: `ALARM_DEDUP_WINDOW_SECS` · Default: `60`
+    #[serde(default = "default_alarm_dedup_window_secs")]
+    pub alarm_dedup_window_secs: u64,
+
     // --- Deployment environment ---
 
     /// Deployment environment tag used for production validation.
@@ -545,6 +566,12 @@ pub fn load_config() -> Result<AppConfig, ConfigLoadError> {
         .set_default("cors_allowed_origins", "")?
         .set_default("allowed_origins", "")?
         .set_default("inbound_webhook_secret", "")?
+        // Alert deduplication window (issue #24); resolved at alarm-manager
+        // initialisation in `main.rs`.
+        .set_default(
+            "alarm_dedup_window_secs",
+            default_alarm_dedup_window_secs(),
+        )?
         .set_default("app_env", default_app_env())?
         .build()?
         .try_deserialize()?;
@@ -605,6 +632,29 @@ mod tests {
         );
         assert_eq!(cfg.database_url, "sqlite://Sky Moon Scope.db");
         assert!(!cfg.is_production());
+    }
+
+    #[test]
+    fn alarm_dedup_window_defaults_to_sixty_seconds() {
+        let _guard = EnvGuard(vec!["ALARM_DEDUP_WINDOW_SECS".into()]);
+        env::remove_var("ALARM_DEDUP_WINDOW_SECS");
+
+        let cfg = load_config().expect("load_config should succeed with defaults");
+        assert_eq!(cfg.alarm_dedup_window_secs, 60);
+    }
+
+    #[test]
+    fn alarm_dedup_window_can_be_overridden_from_env() {
+        let _guard = EnvGuard(vec!["ALARM_DEDUP_WINDOW_SECS".into()]);
+
+        env::set_var("ALARM_DEDUP_WINDOW_SECS", "15");
+        let cfg = load_config().expect("load_config should succeed");
+        assert_eq!(cfg.alarm_dedup_window_secs, 15);
+
+        // Zero is valid: it switches rate limiting off.
+        env::set_var("ALARM_DEDUP_WINDOW_SECS", "0");
+        let cfg = load_config().expect("load_config should succeed");
+        assert_eq!(cfg.alarm_dedup_window_secs, 0);
     }
 
     // ------------------------------------------------------------------
