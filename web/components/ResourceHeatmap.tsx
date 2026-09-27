@@ -2,35 +2,25 @@ import React, { useState, useMemo } from 'react';
 import { Cpu, Database, Zap, Activity, Info, Sliders, Flame, AlertTriangle, MemoryStick } from 'lucide-react';
 import { cn } from '../lib/utils';
 import type { CallGraph, CallNode } from '../lib/sorobantypes';
-
-// ── Soroban Budget Limits ────────────────────────────────────────────────────
-
-const LIMITS = {
-  CPU:          100_000_000,      // 100M instructions
-  RAM:          40 * 1024 * 1024, // 40 MB
-  LEDGER_READ:  150 * 1024,       // 150 KB
-  LEDGER_WRITE: 100 * 1024,       // 100 KB
-  TX_SIZE:      70  * 1024,       // 70 KB
-};
-
-// ── Types ────────────────────────────────────────────────────────────────────
-
-type FnCategory = 'auth' | 'storage' | 'compute' | 'io' | 'util';
-
-interface CpuHotspotCell {
-  id: string;
-  /** Full qualified name, e.g. "contract::function" */
-  fnName: string;
-  /** Abbreviated label that fits inside the cell */
-  displayName: string;
-  category: FnCategory;
-  /** Share of this simulation's total CPU (0–100) */
-  cpuShare: number;
-  /** Absolute estimated instruction count */
-  cpuInstructions: number;
-  /** Call-graph depth; 0 = entry point */
-  depth: number;
-}
+import {
+  HeatmapCell,
+  HeatmapTooltip,
+  HeatmapColorScale,
+  HeatmapZoomControls,
+  type CpuHotspotCell,
+  type FnCategory,
+  type RamRegion,
+  type RamColors,
+  type HotspotColors,
+  LIMITS,
+  RAM_COLORS,
+  READ_SHADES,
+  WRITE_SHADES,
+  CATEGORY_STYLE,
+  hotspotColors,
+  statusColor,
+  fmtInstr,
+} from './heatmap';
 
 // ── RAM allocation types ──────────────────────────────────────────────────────
 
@@ -201,25 +191,6 @@ function defaultRamCells(totalBytes: number): RamAllocCell[] {
   }));
 }
 
-// ── RAM region colours ────────────────────────────────────────────────────────
-
-interface RamColors {
-  hex: string;
-  bg: string;
-  border: string;
-  text: string;
-  badge: string;
-}
-
-const RAM_COLORS: Record<RamRegion, RamColors> = {
-  heap:   { hex: '#f59e0b', bg: 'bg-amber-500/20',   border: 'border-amber-500/50',  text: 'text-amber-300',  badge: 'bg-amber-900/70 text-amber-300 border-amber-700'   },
-  host:   { hex: '#10b981', bg: 'bg-emerald-500/20', border: 'border-emerald-500/50',text: 'text-emerald-300',badge: 'bg-emerald-900/70 text-emerald-300 border-emerald-700'},
-  stack:  { hex: '#0ea5e9', bg: 'bg-sky-500/20',     border: 'border-sky-500/50',    text: 'text-sky-300',    badge: 'bg-sky-900/70 text-sky-300 border-sky-700'           },
-  data:   { hex: '#8b5cf6', bg: 'bg-violet-500/20',  border: 'border-violet-500/50', text: 'text-violet-300', badge: 'bg-violet-900/70 text-violet-300 border-violet-700'  },
-  auth:   { hex: '#ec4899', bg: 'bg-pink-500/20',    border: 'border-pink-500/50',   text: 'text-pink-300',   badge: 'bg-pink-900/70 text-pink-300 border-pink-700'         },
-  buffer: { hex: '#64748b', bg: 'bg-slate-600/20',   border: 'border-slate-500/50',  text: 'text-slate-400',  badge: 'bg-slate-800/70 text-slate-400 border-slate-600'      },
-  event:  { hex: '#6366f1', bg: 'bg-indigo-500/20',  border: 'border-indigo-500/50', text: 'text-indigo-300', badge: 'bg-indigo-900/70 text-indigo-300 border-indigo-700'   },
-};
 
 // ── Ledger segment data builders ─────────────────────────────────────────────
 
@@ -249,47 +220,12 @@ function buildWriteSegments(totalWriteBytes: number): LedgerSegment[] {
   return defs.map(d => ({ ...d, kind: 'write' as LedgerKind, bytes: Math.round((d.share / 100) * totalWriteBytes) }));
 }
 
-// Hex colours for the two kinds and their sub-segments
-const READ_SHADES  = ['#06b6d4', '#0891b2', '#0e7490'] as const;
-const WRITE_SHADES = ['#f43f5e', '#e11d48', '#be123c'] as const;
-
-// ── Colour helpers ────────────────────────────────────────────────────────────
-
-interface HotspotColors {
-  bg: string;
-  border: string;
-  text: string;
-  barHex: string;
-  badge: string;
-  label: string;
-}
-
-function hotspotColors(share: number): HotspotColors {
-  if (share >= 20) return { bg: 'bg-rose-500/75',   border: 'border-rose-400',   text: 'text-rose-100',   barHex: '#f43f5e', badge: 'bg-rose-900/80 text-rose-300',   label: 'CRITICAL' };
-  if (share >= 10) return { bg: 'bg-orange-500/65', border: 'border-orange-400', text: 'text-orange-100', barHex: '#f97316', badge: 'bg-orange-900/80 text-orange-300', label: 'HIGH'     };
-  if (share >=  5) return { bg: 'bg-amber-500/55',  border: 'border-amber-400',  text: 'text-amber-100',  barHex: '#eab308', badge: 'bg-amber-900/80 text-amber-300',   label: 'MEDIUM'   };
-  if (share >=  2) return { bg: 'bg-cyan-700/45',   border: 'border-cyan-500',   text: 'text-cyan-100',   barHex: '#06b6d4', badge: 'bg-cyan-900/80 text-cyan-300',     label: 'LOW'      };
-  return               { bg: 'bg-slate-800/65',  border: 'border-slate-700',  text: 'text-slate-400',  barHex: '#475569', badge: 'bg-slate-800 text-slate-500',        label: 'TRACE'    };
-}
-
-const CATEGORY_STYLE: Record<FnCategory, { label: string; cls: string }> = {
-  auth:    { label: 'AUTH',    cls: 'text-violet-400 border-violet-700 bg-violet-950/60' },
-  storage: { label: 'STORAGE', cls: 'text-blue-400   border-blue-700   bg-blue-950/60'  },
-  compute: { label: 'COMPUTE', cls: 'text-orange-400 border-orange-700 bg-orange-950/60'},
-  io:      { label: 'I/O',     cls: 'text-green-400  border-green-700  bg-green-950/60' },
-  util:    { label: 'UTIL',    cls: 'text-slate-400  border-slate-600  bg-slate-800/60' },
-};
-
 // ── Misc helpers ──────────────────────────────────────────────────────────────
 
 function formatBytes(bytes: number): string {
   if (bytes >= 1024 * 1024) return `${(bytes / (1024 * 1024)).toFixed(2)} MB`;
   if (bytes >= 1024)        return `${(bytes / 1024).toFixed(1)} KB`;
   return `${bytes} B`;
-}
-
-function fmtInstr(n: number): string {
-  return new Intl.NumberFormat('en-US', { notation: 'compact', compactDisplay: 'short' }).format(n);
 }
 
 // ── Component ─────────────────────────────────────────────────────────────────
@@ -301,6 +237,7 @@ export function ResourceHeatmap({ resourceCost, callGraph }: ResourceHeatmapProp
   const [hoveredRamId,      setHoveredRamId]      = useState<string | null>(null);
   const [hoveredSegmentId,  setHoveredSegmentId]  = useState<string | null>(null);
   const [hoveredKey,        setHoveredKey]         = useState<string | null>(null);
+  const [zoom,              setZoom]              = useState<number>(1);
 
   const {
     cpu_instructions,
@@ -751,207 +688,57 @@ export function ResourceHeatmap({ resourceCost, callGraph }: ResourceHeatmapProp
                   {' • '}{fmtInstr(cpu_instructions)} total instructions ({cpuPct.toFixed(1)}% of budget)
                 </p>
               </div>
-              {!isLiveData && (
-                <span className="text-[9px] font-mono bg-slate-800 text-slate-400 border border-slate-700 px-2 py-1 rounded uppercase tracking-widest">
-                  Estimated
-                </span>
-              )}
+              <div className="flex items-center gap-3">
+                <HeatmapZoomControls
+                  zoom={zoom}
+                  onZoomChange={setZoom}
+                  minZoom={0.5}
+                  maxZoom={1.5}
+                  step={0.1}
+                />
+                {!isLiveData && (
+                  <span className="text-[9px] font-mono bg-slate-800 text-slate-400 border border-slate-700 px-2 py-1 rounded uppercase tracking-widest">
+                    Estimated
+                  </span>
+                )}
+              </div>
             </div>
 
             <div className="flex flex-col lg:flex-row gap-5">
 
               {/* ── Hotspot grid ───────────────────────────────────────────── */}
-              <div className="flex-1">
-                <div className="grid grid-cols-3 sm:grid-cols-4 gap-2">
-                  {hotspotCells.map((cell, rank) => {
-                    const clr = hotspotColors(cell.cpuShare);
-                    const isHovered = hoveredCellId === cell.id;
-                    const catStyle = CATEGORY_STYLE[cell.category];
-
-                    return (
-                      <button
-                        key={cell.id}
-                        onMouseEnter={() => setHoveredCellId(cell.id)}
-                        onMouseLeave={() => setHoveredCellId(null)}
-                        className={cn(
-                          'group relative flex flex-col justify-between rounded-lg border p-2.5 text-left',
-                          'transition-all duration-300 cursor-crosshair',
-                          clr.bg, clr.border,
-                          isHovered ? 'scale-[1.06] z-20 ring-2 ring-white/20 shadow-lg' : 'hover:scale-[1.02]',
-                        )}
-                        style={{ minHeight: '84px' }}
-                      >
-                        {/* Rank + category badges */}
-                        <div className="flex items-start justify-between gap-1 mb-1.5">
-                          <span className={cn('text-[8px] font-black font-mono rounded px-1 py-0.5 leading-none', clr.badge)}>
-                            #{rank + 1}
-                          </span>
-                          <span className={cn('text-[8px] font-mono rounded px-1 py-0.5 leading-none border', catStyle.cls)}>
-                            {catStyle.label}
-                          </span>
-                        </div>
-
-                        {/* Function display name */}
-                        <div className={cn('text-[10px] font-bold font-mono leading-tight', clr.text)}>
-                          {cell.displayName}
-                        </div>
-
-                        {/* Mini bar + share % */}
-                        <div className="mt-2">
-                          <div className="flex items-center justify-between mb-0.5">
-                            <span className={cn('text-[9px] font-mono font-bold', clr.text)}>
-                              {cell.cpuShare.toFixed(1)}%
-                            </span>
-                            <span className="text-[8px] text-slate-500 font-mono">{clr.label}</span>
-                          </div>
-                          <div className="h-1 w-full bg-black/30 rounded-full overflow-hidden">
-                            <div
-                              className="h-full rounded-full transition-all duration-700"
-                              style={{
-                                width: `${Math.min(cell.cpuShare * 4, 100)}%`,
-                                backgroundColor: clr.barHex,
-                                opacity: 0.9,
-                              }}
-                            />
-                          </div>
-                        </div>
-                      </button>
-                    );
-                  })}
+              <div className="flex-1 overflow-auto">
+                <div
+                  className="grid grid-cols-3 sm:grid-cols-4 gap-2 transition-transform duration-200"
+                  style={{
+                    transform: `scale(${zoom})`,
+                    transformOrigin: 'top left',
+                    width: zoom !== 1 ? `${100 / zoom}%` : undefined,
+                  }}
+                >
+                  {hotspotCells.map((cell, rank) => (
+                    <HeatmapCell
+                      key={cell.id}
+                      cell={cell}
+                      rank={rank}
+                      isHovered={hoveredCellId === cell.id}
+                      onMouseEnter={() => setHoveredCellId(cell.id)}
+                      onMouseLeave={() => setHoveredCellId(null)}
+                    />
+                  ))}
                 </div>
 
                 {/* Colour legend */}
-                <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[9px] font-mono text-slate-500">
-                  {[
-                    { label: '≥20% Critical', bg: 'bg-rose-500/75',   border: 'border-rose-400'   },
-                    { label: '10–20% High',   bg: 'bg-orange-500/65', border: 'border-orange-400' },
-                    { label: '5–10% Medium',  bg: 'bg-amber-500/55',  border: 'border-amber-400'  },
-                    { label: '2–5% Low',      bg: 'bg-cyan-700/45',   border: 'border-cyan-500'   },
-                    { label: '<2% Trace',     bg: 'bg-slate-800/65',  border: 'border-slate-700'  },
-                  ].map(e => (
-                    <span key={e.label} className="flex items-center gap-1">
-                      <span className={cn('inline-block w-2.5 h-2.5 rounded border', e.bg, e.border)} />
-                      {e.label}
-                    </span>
-                  ))}
-                </div>
+                <HeatmapColorScale variant="hotspot" className="mt-3" />
               </div>
 
               {/* ── Inspector panel ─────────────────────────────────────────── */}
-              <div className="lg:w-64 bg-slate-950/40 border border-slate-800/70 rounded-xl p-4 shadow-sm flex flex-col justify-between min-h-[220px]">
-                <div>
-                  <span className="text-[9px] font-bold text-slate-500 uppercase tracking-widest font-mono">
-                    HOTSPOT INSPECTOR
-                  </span>
-
-                  {hoveredCell ? (
-                    <div className="mt-3 space-y-3">
-                      {/* Full qualified name */}
-                      <div>
-                        <span className="text-[8px] text-slate-500 font-mono uppercase block mb-1">FUNCTION</span>
-                        <code className="text-[11px] font-mono text-slate-100 break-all bg-slate-900 border border-slate-800 rounded px-2 py-1.5 block leading-snug">
-                          {hoveredCell.fnName}
-                        </code>
-                      </div>
-
-                      {/* Category */}
-                      <div className="flex items-center gap-2">
-                        <span className="text-[8px] text-slate-500 font-mono uppercase">CATEGORY</span>
-                        <span className={cn('text-[9px] font-mono font-bold rounded px-1.5 py-0.5 border', CATEGORY_STYLE[hoveredCell.category].cls)}>
-                          {CATEGORY_STYLE[hoveredCell.category].label}
-                        </span>
-                      </div>
-
-                      {/* Stat grid */}
-                      <div className="grid grid-cols-2 gap-2">
-                        <div className="bg-slate-900 border border-slate-800 rounded p-2">
-                          <span className="text-[8px] font-mono text-slate-500 uppercase block">CPU SHARE</span>
-                          <span className="text-sm font-mono font-black text-slate-100 mt-0.5 block">
-                            {hoveredCell.cpuShare.toFixed(1)}%
-                          </span>
-                        </div>
-                        <div className="bg-slate-900 border border-slate-800 rounded p-2">
-                          <span className="text-[8px] font-mono text-slate-500 uppercase block">INSTRUCTIONS</span>
-                          <span className="text-sm font-mono font-black text-slate-100 mt-0.5 block">
-                            {fmtInstr(hoveredCell.cpuInstructions)}
-                          </span>
-                        </div>
-
-                        {/* Budget bar */}
-                        <div className="col-span-2 bg-slate-900 border border-slate-800 rounded p-2">
-                          <span className="text-[8px] font-mono text-slate-500 uppercase block mb-1">OF 100M BUDGET</span>
-                          <div className="h-1.5 w-full bg-black/40 rounded-full overflow-hidden">
-                            <div
-                              className="h-full rounded-full transition-all duration-700"
-                              style={{
-                                width: `${Math.min((hoveredCell.cpuInstructions / LIMITS.CPU) * 100, 100)}%`,
-                                backgroundColor: hotspotColors(hoveredCell.cpuShare).barHex,
-                              }}
-                            />
-                          </div>
-                          <span className="text-[9px] font-mono text-slate-400 mt-0.5 block">
-                            {((hoveredCell.cpuInstructions / LIMITS.CPU) * 100).toFixed(2)}%
-                          </span>
-                        </div>
-                      </div>
-
-                      {/* Severity pill */}
-                      <div className={cn(
-                        'rounded px-2 py-1 text-[9px] font-mono font-bold border text-center',
-                        hotspotColors(hoveredCell.cpuShare).badge,
-                        hotspotColors(hoveredCell.cpuShare).border,
-                      )}>
-                        SEVERITY: {hotspotColors(hoveredCell.cpuShare).label}
-                      </div>
-                    </div>
-                  ) : isLiveData ? (
-                    <div className="mt-4">
-                      <p className="text-xs text-slate-400 font-bold">Hover a cell for details</p>
-                      <p className="text-[11px] text-slate-600 mt-2 leading-relaxed">
-                        Each cell maps a contract function to its estimated CPU instruction cost.
-                        Brighter cells are hotter. Pulsing cells are critical hotspots.
-                      </p>
-
-                      <div className="mt-4 space-y-1.5">
-                        <span className="text-[9px] font-mono text-slate-500 uppercase block">Top Hotspots</span>
-                        {hotspotCells.slice(0, 3).map((c, i) => {
-                          const clr = hotspotColors(c.cpuShare);
-                          return (
-                            <div
-                              key={c.id}
-                              className={cn('flex items-center gap-2 rounded px-2 py-1.5 border', clr.bg, clr.border)}
-                            >
-                              <span className={cn('text-[8px] font-mono font-black w-4 shrink-0', clr.text)}>#{i + 1}</span>
-                              <span className={cn('text-[10px] font-mono flex-1 truncate', clr.text)}>{c.displayName}</span>
-                              <span className={cn('text-[9px] font-mono font-bold shrink-0', clr.text)}>{c.cpuShare.toFixed(0)}%</span>
-                            </div>
-                          );
-                        })}
-                      </div>
-                    </div>
-                  ) : (
-                  <div className="mt-4">
-                    <h4 className="text-sm font-bold text-slate-400">Hover over matrix core blocks</h4>
-                    <p className="text-xs text-slate-500 mt-2 leading-relaxed">
-                      Each tile in this 6x6 grid maps a segment of your contract&apos;s resources. Highly optimized structures keep blocks within deep teal (Optimal). High-load areas transition into orange (Warning) and red (Critical).
-                    </p>
-                    <div className="mt-6 flex flex-wrap gap-4 text-[10px] font-mono text-slate-500">
-                      <div className="flex items-center gap-1.5"><div className="w-2.5 h-2.5 rounded bg-emerald-950 border border-emerald-500/20"></div> Optimal (&lt;20%)</div>
-                      <div className="flex items-center gap-1.5"><div className="w-2.5 h-2.5 rounded bg-cyan-950 border border-cyan-500/40"></div> Normal (20%-50%)</div>
-                      <div className="flex items-center gap-1.5"><div className="w-2.5 h-2.5 rounded bg-amber-500/30 border border-amber-400/40"></div> Warning (50%-80%)</div>
-                      <div className="flex items-center gap-1.5"><div className="w-2.5 h-2.5 rounded bg-rose-500/80 border-rose-400/80 shadow-[0_0_6px_rgba(244,63,94,0.4)]"></div> Critical (&gt;80%)</div>
-                    </div>
-                  </div>
-                  )}
-                </div>
-
-                <div className="border-t border-slate-900 pt-2 mt-4 text-[9px] font-mono text-slate-600 flex items-center justify-between">
-                  <span>{isLiveData ? 'LIVE DATA' : 'ESTIMATED'}</span>
-                  <span className="flex items-center gap-1">
-                    <Info className="h-3 w-3" /> {hotspotCells.length} functions
-                  </span>
-                </div>
-              </div>
+              <HeatmapTooltip
+                hoveredCell={hoveredCell}
+                hotspotCells={hotspotCells}
+                isLiveData={isLiveData}
+                className="lg:w-64"
+              />
             </div>
 
             {/* ── Critical path banner (shown when top function ≥ 15%) ──────── */}
@@ -1438,3 +1225,32 @@ export function ResourceHeatmap({ resourceCost, callGraph }: ResourceHeatmapProp
     </div>
   );
 }
+
+// ── Re-exports ────────────────────────────────────────────────────────────────
+
+export {
+  LIMITS,
+  RAM_COLORS,
+  READ_SHADES,
+  WRITE_SHADES,
+  CATEGORY_STYLE,
+  hotspotColors,
+  statusColor,
+  fmtInstr,
+  HeatmapCell,
+  HeatmapTooltip,
+  HeatmapColorScale,
+  HeatmapZoomControls,
+};
+
+export type {
+  FnCategory,
+  RamRegion,
+  RamColors,
+  HotspotColors,
+  CpuHotspotCell,
+  RamAllocCell,
+  LedgerSegment,
+  ResourceHeatmapProps,
+};
+
