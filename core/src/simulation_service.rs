@@ -4,10 +4,16 @@ use crate::errors::AppError;
 use reqwest::Client;
 use rusqlite::{params, Connection};
 use serde::{Deserialize, Serialize};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 const DEFAULT_ZSCORE_THRESHOLD: f64 = 2.0;
 const DEFAULT_SHIFT_THRESHOLD: f64 = 0.10;
+
+/// Default ceiling on how many simulations a single API key may run at the
+/// same time. Operators can override it when building the service.
+pub const DEFAULT_MAX_CONCURRENT_SIMULATIONS_PER_KEY: usize = 4;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SimulationMetric {
@@ -44,24 +50,187 @@ pub struct AnalysisResult {
     pub alert_triggered: bool,
 }
 
+/// Per-API-key concurrency limiter for the simulation engine.
+///
+/// The issue asked for a `DashMap<ApiKey, AtomicUsize>` semaphore. `dashmap`
+/// is not a dependency of this crate, and this change deliberately does not
+/// add a new dependency, so the limiter is built from primitives that are
+/// already available: an `Arc<Mutex<HashMap<..>>>` keyed by the API key. The
+/// observable contract matches the requested design — a per-key in-flight
+/// counter, an `AppError::TooManyRequests` (HTTP `429`) once the limit is
+/// reached, and a slot that is released on *every* exit path (success, error,
+/// or panic) through the RAII [`ConcurrencyPermit`].
+#[derive(Debug, Clone)]
+pub struct ConcurrencyLimiter {
+    max_per_key: usize,
+    in_flight: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl ConcurrencyLimiter {
+    /// Create a limiter that admits at most `max_per_key` concurrent
+    /// simulations for any single API key.
+    pub fn new(max_per_key: usize) -> Self {
+        Self {
+            max_per_key: max_per_key.max(1),
+            in_flight: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+
+    /// The configured ceiling for a single API key.
+    pub fn max_per_key(&self) -> usize {
+        self.max_per_key
+    }
+
+    /// Number of simulations currently admitted for `api_key`.
+    pub fn in_flight(&self, api_key: &str) -> usize {
+        self.lock().get(api_key).copied().unwrap_or(0)
+    }
+
+    /// Try to reserve a simulation slot for `api_key`.
+    ///
+    /// Returns a [`ConcurrencyPermit`] that releases the slot when dropped, or
+    /// [`AppError::TooManyRequests`] when the key already has `max_per_key`
+    /// simulations in flight. The check and the increment happen under a single
+    /// lock acquisition so concurrent callers cannot race past the limit.
+    pub fn try_acquire(&self, api_key: impl Into<String>) -> Result<ConcurrencyPermit, AppError> {
+        let api_key = api_key.into();
+        let mut in_flight = self.lock();
+        let count = in_flight.entry(api_key.clone()).or_insert(0);
+        if *count >= self.max_per_key {
+            return Err(AppError::TooManyRequests(format!(
+                "API key is limited to {} concurrent simulations",
+                self.max_per_key
+            )));
+        }
+        *count += 1;
+        drop(in_flight);
+
+        Ok(ConcurrencyPermit {
+            api_key,
+            in_flight: Arc::clone(&self.in_flight),
+        })
+    }
+
+    fn lock(&self) -> MutexGuard<'_, HashMap<String, usize>> {
+        // A panic in another request must not poison the limiter and lock every
+        // other API key out, so recover from a poisoned mutex instead.
+        self.in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
+/// RAII guard for a reserved per-key simulation slot.
+///
+/// Dropping the permit decrements the API key's in-flight counter, which
+/// guarantees the slot is returned when the guarded work succeeds, fails, or
+/// unwinds.
+#[derive(Debug)]
+pub struct ConcurrencyPermit {
+    api_key: String,
+    in_flight: Arc<Mutex<HashMap<String, usize>>>,
+}
+
+impl ConcurrencyPermit {
+    /// The API key this permit was issued for.
+    pub fn api_key(&self) -> &str {
+        &self.api_key
+    }
+}
+
+impl Drop for ConcurrencyPermit {
+    fn drop(&mut self) {
+        let mut in_flight = self
+            .in_flight
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(count) = in_flight.get_mut(&self.api_key) {
+            *count = count.saturating_sub(1);
+            if *count == 0 {
+                in_flight.remove(&self.api_key);
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct SimulationService {
     db_path: PathBuf,
     shift_threshold: f64,
     zscore_threshold: f64,
     webhook_url: Option<String>,
+    limiter: ConcurrencyLimiter,
 }
 
 impl SimulationService {
     pub fn new(db_path: impl AsRef<Path>, webhook_url: Option<String>) -> Result<Self, AppError> {
+        Self::new_with_limit(
+            db_path,
+            webhook_url,
+            DEFAULT_MAX_CONCURRENT_SIMULATIONS_PER_KEY,
+        )
+    }
+
+    /// Like [`SimulationService::new`], but with an explicit per-API-key
+    /// concurrency ceiling.
+    pub fn new_with_limit(
+        db_path: impl AsRef<Path>,
+        webhook_url: Option<String>,
+        max_concurrent_per_key: usize,
+    ) -> Result<Self, AppError> {
         let service = Self {
             db_path: db_path.as_ref().to_path_buf(),
             shift_threshold: DEFAULT_SHIFT_THRESHOLD,
             zscore_threshold: DEFAULT_ZSCORE_THRESHOLD,
             webhook_url,
+            limiter: ConcurrencyLimiter::new(max_concurrent_per_key),
         };
         service.ensure_schema()?;
         Ok(service)
+    }
+
+    /// Override the per-API-key concurrency ceiling on an existing service.
+    pub fn with_concurrency_limit(mut self, max_concurrent_per_key: usize) -> Self {
+        self.limiter = ConcurrencyLimiter::new(max_concurrent_per_key);
+        self
+    }
+
+    /// The configured per-API-key concurrency ceiling.
+    pub fn max_concurrent_simulations_per_key(&self) -> usize {
+        self.limiter.max_per_key()
+    }
+
+    /// Number of simulations currently in flight for `api_key`.
+    pub fn in_flight_simulations(&self, api_key: &str) -> usize {
+        self.limiter.in_flight(api_key)
+    }
+
+    /// Reserve a simulation slot for `api_key` without running anything.
+    ///
+    /// Useful for callers that drive the simulation engine directly and only
+    /// need the shared per-key accounting; the returned
+    /// [`ConcurrencyPermit`] releases the slot when dropped.
+    pub fn try_acquire_simulation_slot(
+        &self,
+        api_key: &str,
+    ) -> Result<ConcurrencyPermit, AppError> {
+        self.limiter.try_acquire(api_key)
+    }
+
+    /// Record and analyze a metric on behalf of a specific API key.
+    ///
+    /// A key may only have `max_concurrent_simulations_per_key` simulations in
+    /// flight at once; anything past that is rejected with
+    /// [`AppError::TooManyRequests`], which the HTTP layer renders as
+    /// `429 Too Many Requests`. The slot is released whether the work succeeds,
+    /// returns an error, or panics.
+    pub async fn record_and_analyze_for_key(
+        &self,
+        api_key: &str,
+        metric: SimulationMetric,
+    ) -> Result<AnalysisResult, AppError> {
+        let _permit = self.limiter.try_acquire(api_key)?;
+        self.record_and_analyze(metric).await
     }
 
     fn connect(&self) -> Result<Connection, AppError> {
@@ -364,6 +533,8 @@ fn z_score(current: f64, values: &[f64]) -> Option<f64> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use axum::http::StatusCode;
+    use axum::response::IntoResponse;
     use rusqlite::Connection;
     use std::fs;
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -506,5 +677,142 @@ mod tests {
             .map(|z| z.abs() > DEFAULT_ZSCORE_THRESHOLD)
             .unwrap_or(false));
         assert_eq!(alert_count(&db_path.0), 1);
+    }
+
+    // ── Per-API-key concurrency limit (issue #25) ────────────────────────
+
+    #[test]
+    fn limiter_admits_up_to_limit_and_rejects_excess() {
+        let limiter = ConcurrencyLimiter::new(2);
+
+        let first = limiter.try_acquire("key-a").expect("first slot");
+        let second = limiter.try_acquire("key-a").expect("second slot");
+        assert_eq!(limiter.max_per_key(), 2);
+        assert_eq!(limiter.in_flight("key-a"), 2);
+
+        let rejected = limiter
+            .try_acquire("key-a")
+            .expect_err("third concurrent slot must be rejected");
+        assert!(matches!(rejected, AppError::TooManyRequests(_)));
+        assert_eq!(
+            rejected.into_response().status(),
+            StatusCode::TOO_MANY_REQUESTS
+        );
+        assert_eq!(limiter.in_flight("key-a"), 2);
+
+        // Dropping a permit returns exactly one slot.
+        drop(first);
+        assert_eq!(limiter.in_flight("key-a"), 1);
+        let third = limiter.try_acquire("key-a").expect("freed slot is reusable");
+        assert_eq!(limiter.in_flight("key-a"), 2);
+
+        drop(second);
+        drop(third);
+        assert_eq!(limiter.in_flight("key-a"), 0);
+    }
+
+    #[test]
+    fn limiter_isolates_limits_per_api_key() {
+        let limiter = ConcurrencyLimiter::new(1);
+        let _held = limiter.try_acquire("key-a").expect("key-a slot");
+        assert_eq!(limiter.in_flight("key-a"), 1);
+        assert!(limiter.try_acquire("key-a").is_err());
+
+        // A saturated key must not starve a different key.
+        let _other = limiter.try_acquire("key-b").expect("key-b slot");
+        assert_eq!(limiter.in_flight("key-b"), 1);
+        assert_eq!(limiter.in_flight("key-a"), 1);
+    }
+
+    #[test]
+    fn limiter_releases_slot_when_guarded_work_errors() {
+        let limiter = ConcurrencyLimiter::new(1);
+
+        let outcome = (|| -> Result<(), AppError> {
+            let _permit = limiter.try_acquire("key-a")?;
+            Err(AppError::Internal("simulated failure".into()))
+        })();
+
+        assert!(outcome.is_err());
+        assert_eq!(limiter.in_flight("key-a"), 0);
+
+        // The slot freed on the error path is immediately reusable.
+        let _permit = limiter
+            .try_acquire("key-a")
+            .expect("slot must be released on the error path");
+    }
+
+    #[test]
+    fn limiter_releases_slot_when_guarded_work_panics() {
+        let limiter = ConcurrencyLimiter::new(1);
+
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            let _permit = limiter.try_acquire("key-a").expect("slot");
+            panic!("simulated panic while holding a simulation slot");
+        }));
+
+        assert!(result.is_err(), "the closure is expected to unwind");
+        assert_eq!(limiter.in_flight("key-a"), 0);
+    }
+
+    #[tokio::test]
+    async fn record_and_analyze_for_key_rejects_over_limit() {
+        let db_path = TempDbPath::new("per_key_concurrency_limit");
+        let service = SimulationService::new_with_limit(&db_path.0, None, 1)
+            .expect("initialize simulation service");
+        assert_eq!(service.max_concurrent_simulations_per_key(), 1);
+
+        let held = service
+            .try_acquire_simulation_slot("key-a")
+            .expect("first slot should be admitted");
+        assert_eq!(service.in_flight_simulations("key-a"), 1);
+
+        let err = service
+            .record_and_analyze_for_key("key-a", metric("token", "mint", "hash-a", 1, 1, 1))
+            .await
+            .expect_err("second concurrent simulation must be rejected");
+        assert!(matches!(err, AppError::TooManyRequests(_)));
+        assert_eq!(err.into_response().status(), StatusCode::TOO_MANY_REQUESTS);
+
+        // The rejected request must not have touched the database.
+        let conn = Connection::open(&db_path.0).expect("open sqlite database");
+        let persisted: i64 = conn
+            .query_row("SELECT COUNT(*) FROM simulation_metrics", [], |row| {
+                row.get(0)
+            })
+            .expect("count metrics");
+        assert_eq!(persisted, 0);
+
+        drop(held);
+        assert_eq!(service.in_flight_simulations("key-a"), 0);
+
+        // Once the slot is released the same key can run again, and the slot is
+        // returned after the call completes.
+        service
+            .record_and_analyze_for_key("key-a", metric("token", "mint", "hash-a", 1, 1, 1))
+            .await
+            .expect("key should be admitted after the slot is released");
+        assert_eq!(service.in_flight_simulations("key-a"), 0);
+    }
+
+    #[tokio::test]
+    async fn record_and_analyze_for_key_keeps_keys_independent() {
+        let db_path = TempDbPath::new("per_key_independent_limits");
+        let service = SimulationService::new_with_limit(&db_path.0, None, 1)
+            .expect("initialize simulation service");
+
+        let held = service
+            .try_acquire_simulation_slot("key-a")
+            .expect("key-a slot");
+
+        let result = service
+            .record_and_analyze_for_key("key-b", metric("token", "mint", "hash-b", 1, 1, 1))
+            .await
+            .expect("key-b must not be blocked by key-a");
+        assert!(!result.has_historical_baseline);
+        assert_eq!(service.in_flight_simulations("key-b"), 0);
+
+        drop(held);
+        assert_eq!(service.in_flight_simulations("key-a"), 0);
     }
 }
