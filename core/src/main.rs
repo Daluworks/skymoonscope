@@ -1,4 +1,3 @@
-```rust
 #![allow(dead_code)]
 
 mod auth;
@@ -3321,5 +3320,3 @@ async fn analyze_simulation(
     let result = simulation_service.record_and_analyze(metric).await?;
     Ok(Json(result))
 }
-
-```
