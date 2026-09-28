@@ -1,6 +1,7 @@
 use crate::simulation::{SimulationEngine, SimulationError, SorobanResources};
 use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
+use thiserror::Error;
 use utoipa::ToSchema;
 
 // ── Regression threshold ─────────────────────────────────────────────────────
@@ -25,6 +26,50 @@ pub enum CompareMode {
         function_name: String,
         args: Vec<String>,
     },
+}
+
+/// Errors produced while running a comparison.
+///
+/// A comparison is a diff between a *current* snapshot and a *baseline*
+/// snapshot. When the baseline is missing (for example because only a single
+/// snapshot exists for a contract) the operation must fail with
+/// [`ComparisonError::BaselineNotFound`] instead of panicking, so the HTTP
+/// layer can translate it into a structured `404 Not Found` response.
+#[derive(Error, Debug)]
+pub enum ComparisonError {
+    /// No baseline snapshot is available to diff the current snapshot against.
+    ///
+    /// The payload is the identifier of the snapshot that was requested (or the
+    /// current snapshot when no baseline id exists yet).
+    #[error("Baseline snapshot not found: {0}")]
+    BaselineNotFound(String),
+
+    /// A snapshot could not be captured because the underlying simulation
+    /// failed.
+    #[error(transparent)]
+    Simulation(#[from] SimulationError),
+}
+
+/// A point-in-time capture of a contract's measured resource usage.
+///
+/// Snapshots are the inputs to a comparison: the most recent snapshot is the
+/// *current* side of the diff and the preceding one is the *baseline*.
+#[derive(Debug, Clone, Serialize, Deserialize, ToSchema, PartialEq, Eq)]
+pub struct Snapshot {
+    /// Identifier for the snapshot (a contract id, version label or WASM path).
+    pub id: String,
+    /// Resource metrics captured for this snapshot.
+    pub resources: SorobanResources,
+}
+
+impl Snapshot {
+    /// Build a snapshot from an identifier and measured resource usage.
+    pub fn new(id: impl Into<String>, resources: SorobanResources) -> Self {
+        Self {
+            id: id.into(),
+            resources,
+        }
+    }
 }
 
 /// Percentage change for each tracked resource metric.
@@ -83,7 +128,7 @@ pub struct RegressionReport {
 pub async fn run_comparison(
     engine: &SimulationEngine,
     mode: CompareMode,
-) -> Result<RegressionReport, SimulationError> {
+) -> Result<RegressionReport, ComparisonError> {
     let (current_resources, base_resources) = match mode {
         CompareMode::LocalVsLocal {
             current_wasm,
@@ -135,6 +180,33 @@ pub async fn run_comparison(
     };
 
     Ok(build_report(current_resources, base_resources))
+}
+
+/// Compare the most recent snapshot in `snapshots` against its baseline.
+///
+/// The last element is treated as the *current* snapshot and the element before
+/// it as the *baseline*. A comparison requires at least two snapshots: with
+/// only one snapshot there is nothing to diff against, and with none there is
+/// no snapshot at all. Both cases return
+/// [`ComparisonError::BaselineNotFound`] rather than panicking on an
+/// out-of-bounds index or unwrapping a `None`.
+///
+/// This is the snapshot-based counterpart to [`run_comparison`], which captures
+/// its snapshots live through a [`SimulationEngine`].
+pub fn compare_snapshots(snapshots: &[Snapshot]) -> Result<RegressionReport, ComparisonError> {
+    match snapshots.split_last() {
+        Some((current, baseline_candidates)) => match baseline_candidates.last() {
+            Some(baseline) => Ok(build_report(
+                current.resources.clone(),
+                baseline.resources.clone(),
+            )),
+            // Only the current snapshot exists — there is no baseline to diff
+            // against. Surface this as a typed error instead of panicking.
+            None => Err(ComparisonError::BaselineNotFound(current.id.clone())),
+        },
+        // No snapshots were provided at all.
+        None => Err(ComparisonError::BaselineNotFound("<none>".to_string())),
+    }
 }
 
 /// Build a `RegressionReport` from two sets of resource metrics.
@@ -309,6 +381,7 @@ fn print_metric_row(label: &str, current: u64, base: u64, delta: f64) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::errors::AppError;
 
     fn make_resources(cpu: u64, ram: u64, lr: u64, lw: u64, tx: u64) -> SorobanResources {
         SorobanResources {
@@ -498,5 +571,77 @@ mod tests {
         assert_eq!(report.regression_flags.len(), 1);
         assert_eq!(report.regression_flags[0].resource, "cpu_instructions");
         assert!(report.summary.contains("regression(s) detected"));
+    }
+
+    // ── Snapshot / baseline resolution ───────────────────────────────────
+
+    fn make_snapshot(id: &str, cpu: u64, ram: u64, lr: u64, lw: u64, tx: u64) -> Snapshot {
+        Snapshot::new(id, make_resources(cpu, ram, lr, lw, tx))
+    }
+
+    #[test]
+    fn test_compare_snapshots_two_snapshots_compare_fine() {
+        let baseline = make_snapshot("v1", 1000, 2000, 400, 300, 100);
+        let current = make_snapshot("v2", 1150, 2000, 500, 300, 100);
+
+        let report =
+            compare_snapshots(&[baseline, current]).expect("two snapshots should compare fine");
+
+        assert_eq!(report.current.cpu_instructions, 1150);
+        assert_eq!(report.base.cpu_instructions, 1000);
+        assert!((report.deltas.cpu_instructions - 15.0).abs() < 0.001);
+        assert!(report
+            .regression_flags
+            .iter()
+            .any(|f| f.resource == "cpu_instructions"));
+    }
+
+    #[test]
+    fn test_compare_snapshots_single_snapshot_returns_baseline_not_found() {
+        let only = make_snapshot("v1", 1000, 2000, 400, 300, 100);
+
+        // Must not panic: a lone snapshot has no baseline, so it returns the
+        // typed `BaselineNotFound` error instead of indexing out of bounds.
+        let err = compare_snapshots(&[only]).expect_err("a single snapshot has no baseline");
+
+        match err {
+            ComparisonError::BaselineNotFound(id) => assert_eq!(id, "v1"),
+            other => panic!("expected ComparisonError::BaselineNotFound, got {:?}", other),
+        }
+    }
+
+    #[test]
+    fn test_compare_snapshots_empty_returns_baseline_not_found() {
+        let err = compare_snapshots(&[]).expect_err("no snapshots to compare");
+
+        assert!(matches!(err, ComparisonError::BaselineNotFound(_)));
+    }
+
+    #[test]
+    fn test_baseline_not_found_maps_to_http_404() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let app_error: AppError = ComparisonError::BaselineNotFound("v1".to_string()).into();
+
+        assert_eq!(
+            app_error.into_response().status(),
+            StatusCode::NOT_FOUND,
+            "BaselineNotFound must surface as HTTP 404"
+        );
+    }
+
+    #[test]
+    fn test_simulation_failure_maps_to_http_500() {
+        use axum::http::StatusCode;
+        use axum::response::IntoResponse;
+
+        let app_error: AppError =
+            ComparisonError::Simulation(SimulationError::NodeTimeout).into();
+
+        assert_eq!(
+            app_error.into_response().status(),
+            StatusCode::INTERNAL_SERVER_ERROR
+        );
     }
 }

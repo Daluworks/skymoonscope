@@ -1508,6 +1508,7 @@ pub struct CompareApiResponse {
     responses(
         (status = 200, description = "Comparison report", body = CompareApiResponse),
         (status = 400, description = "Invalid request"),
+        (status = 404, description = "Baseline snapshot not found"),
         (status = 500, description = "Comparison failed")
     ),
     tag = "Analysis"
@@ -1625,9 +1626,10 @@ async fn compare_handler(
         }
     };
 
-    let report = comparison::run_comparison(&state.engine, compare_mode)
-        .await
-        .map_err(|e| AppError::Internal(format!("Comparison failed: {}", e)))?;
+    // `?` converts `ComparisonError` into `AppError` via the crate's `From`
+    // impl, so a missing baseline snapshot surfaces as `404 Not Found` instead
+    // of a generic `500`.
+    let report = comparison::run_comparison(&state.engine, compare_mode).await?;
 
     Ok(Json(CompareApiResponse { report }))
 }
@@ -2277,7 +2279,7 @@ async fn main() {
                 comparison::print_report(&report);
             }
             Err(e) => {
-                eprintln!("Error: Comparison failed: {}", e);
+                eprintln!("Error: {}", e);
                 std::process::exit(1);
             }
         }
