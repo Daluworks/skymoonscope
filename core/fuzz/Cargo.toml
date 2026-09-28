@@ -9,6 +9,7 @@ cargo-fuzz = true
 
 [dependencies]
 libfuzzer-sys = "0.4"
+base64 = "0.22"
 
 [dependencies.sky-moon-scope-core]
 path = ".."
@@ -30,5 +31,11 @@ doc = false
 [[bin]]
 name = "merkle_hex"
 path = "fuzz_targets/merkle_hex.rs"
+test = false
+doc = false
+
+[[bin]]
+name = "xdr_decode"
+path = "fuzz_targets/xdr_decode.rs"
 test = false
 doc = false

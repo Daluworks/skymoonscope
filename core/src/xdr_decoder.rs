@@ -157,39 +157,24 @@ impl XdrTransactionResultDecoder {
 
     /// Decodes the `resultMetaXdr` returned by Soroban RPC `getTransaction`.
     pub fn decode_result_meta(xdr: &str) -> Result<DecodedTransactionResult, XdrDecodeError> {
-        let result =
-            TransactionResultMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-                XdrDecodeError::InvalidXdr {
-                    kind: "transaction result metadata",
-                    source,
-                }
-            })?;
+        let result: TransactionResultMeta =
+            Self::decode_xdr_base64(xdr, "transaction result metadata")?;
         let meta = soroban_meta(&result.tx_apply_processing)
             .ok_or(XdrDecodeError::MissingSorobanMetadata)?;
-        Ok(Self::decode_soroban_meta(meta))
+        Self::decode_soroban_meta(meta)
     }
 
     /// Decodes standalone `SorobanTransactionMeta` XDR.
     pub fn decode_soroban_meta_xdr(xdr: &str) -> Result<DecodedTransactionResult, XdrDecodeError> {
-        let meta =
-            SorobanTransactionMeta::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-                XdrDecodeError::InvalidXdr {
-                    kind: "Soroban transaction metadata",
-                    source,
-                }
-            })?;
-        Ok(Self::decode_soroban_meta(&meta))
+        let meta: SorobanTransactionMeta =
+            Self::decode_xdr_base64(xdr, "Soroban transaction metadata")?;
+        Self::decode_soroban_meta(&meta)
     }
 
     /// Decodes host-function invocations from an RPC `envelopeXdr` value.
     pub fn decode_envelope(xdr: &str) -> Result<Vec<DecodedInvocation>, XdrDecodeError> {
-        let envelope =
-            TransactionEnvelope::from_xdr_base64(xdr, Limits::none()).map_err(|source| {
-                XdrDecodeError::InvalidXdr {
-                    kind: "transaction envelope",
-                    source,
-                }
-            })?;
+        let envelope: TransactionEnvelope =
+            Self::decode_xdr_base64(xdr, "transaction envelope")?;
         Ok(decode_envelope(&envelope))
     }
 
@@ -205,18 +190,36 @@ impl XdrTransactionResultDecoder {
         Ok(decoded)
     }
 
-    pub fn decode_soroban_meta(meta: &SorobanTransactionMeta) -> DecodedTransactionResult {
+    /// Decodes a `SorobanTransactionMeta` into API-friendly diagnostics.
+    ///
+    /// This is fallible because field values are attacker-controlled: a
+    /// malformed payload can encode resource fees whose sum overflows `i64`.
+    /// Such inputs return `Err` instead of panicking.
+    pub fn decode_soroban_meta(
+        meta: &SorobanTransactionMeta,
+    ) -> Result<DecodedTransactionResult, XdrDecodeError> {
         let fees = match &meta.ext {
             SorobanTransactionMetaExt::V0 => ResourceFeeBreakdown::default(),
-            SorobanTransactionMetaExt::V1(fees) => ResourceFeeBreakdown {
-                non_refundable: fees.total_non_refundable_resource_fee_charged,
-                refundable: fees.total_refundable_resource_fee_charged,
-                rent: fees.rent_fee_charged,
-                total: fees.total_non_refundable_resource_fee_charged
-                    + fees.total_refundable_resource_fee_charged,
-            },
+            SorobanTransactionMetaExt::V1(fees) => {
+                let total = fees
+                    .total_non_refundable_resource_fee_charged
+                    .checked_add(fees.total_refundable_resource_fee_charged)
+                    .ok_or_else(|| {
+                        XdrDecodeError::CorruptPayload(XdrDecodeErrorInfo {
+                            kind: "soroban_metadata".to_string(),
+                            offset: None,
+                            message: "resource fee total overflows i64".to_string(),
+                        })
+                    })?;
+                ResourceFeeBreakdown {
+                    non_refundable: fees.total_non_refundable_resource_fee_charged,
+                    refundable: fees.total_refundable_resource_fee_charged,
+                    rent: fees.rent_fee_charged,
+                    total,
+                }
+            }
         };
-        DecodedTransactionResult {
+        Ok(DecodedTransactionResult {
             invocations: Vec::new(),
             events: meta.events.iter().map(decode_event).collect(),
             diagnostics: meta
@@ -229,7 +232,7 @@ impl XdrTransactionResultDecoder {
                 .collect(),
             return_value: format_sc_val(&meta.return_value),
             fees,
-        }
+        })
     }
 }
 
@@ -317,7 +320,7 @@ fn format_sc_val(value: &soroban_sdk::xdr::ScVal) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use soroban_sdk::xdr::{ScVal, VecM, WriteXdr};
+    use soroban_sdk::xdr::{ExtensionPoint, ScVal, SorobanTransactionMetaExtV1, VecM, WriteXdr};
 
     #[test]
     fn decodes_return_value_and_v0_fees_from_xdr() {
@@ -374,8 +377,85 @@ mod tests {
     }
 
     #[test]
-    fn handles_empty_or_whitespace_xdr_gracefully() {
-        let error = XdrTransactionResultDecoder::decode_soroban_meta_xdr("   ").unwrap_err();
+    fn handles_empty_or_whitespace_xdr_without_panicking() {
+        // Empty and whitespace-only inputs must surface as `Err`, not a panic.
+        assert!(XdrTransactionResultDecoder::decode_soroban_meta_xdr("   ").is_err());
+        assert!(XdrTransactionResultDecoder::decode_soroban_meta_xdr("").is_err());
+        assert!(XdrTransactionResultDecoder::decode_result_meta("").is_err());
+        assert!(XdrTransactionResultDecoder::decode_envelope("").is_err());
+    }
+
+    #[test]
+    fn rejects_truncated_soroban_meta_payload() {
+        let meta = SorobanTransactionMeta {
+            ext: SorobanTransactionMetaExt::V0,
+            events: VecM::default(),
+            return_value: ScVal::U32(42),
+            diagnostic_events: VecM::default(),
+        };
+        let full = BASE64
+            .decode(meta.to_xdr_base64(Limits::none()).unwrap())
+            .unwrap();
+        // Drop the tail so the reader hits EOF mid-structure.
+        let truncated = BASE64.encode(&full[..full.len() / 2]);
+        let error = XdrTransactionResultDecoder::decode_soroban_meta_xdr(&truncated).unwrap_err();
+        assert!(matches!(error, XdrDecodeError::InvalidXdr { .. }));
+        assert!(error.offset().is_some());
+    }
+
+    #[test]
+    fn rejects_unknown_meta_ext_discriminant() {
+        // A bogus enum discriminant for `SorobanTransactionMetaExt` (i32::MAX).
+        let encoded = BASE64.encode([0xFF, 0xFF, 0xFF, 0x7F]);
+        let error = XdrTransactionResultDecoder::decode_soroban_meta_xdr(&encoded).unwrap_err();
+        assert!(matches!(error, XdrDecodeError::InvalidXdr { .. }));
+    }
+
+    #[test]
+    fn rejects_fee_total_overflow_instead_of_panicking() {
+        let meta = SorobanTransactionMeta {
+            ext: SorobanTransactionMetaExt::V1(SorobanTransactionMetaExtV1 {
+                ext: ExtensionPoint::V0,
+                total_non_refundable_resource_fee_charged: i64::MAX,
+                total_refundable_resource_fee_charged: 1,
+                rent_fee_charged: 0,
+            }),
+            events: VecM::default(),
+            return_value: ScVal::Void,
+            diagnostic_events: VecM::default(),
+        };
+
+        // The helper must return Err rather than overflow-panicking.
+        let error = XdrTransactionResultDecoder::decode_soroban_meta(&meta).unwrap_err();
+        assert!(matches!(error, XdrDecodeError::CorruptPayload(_)));
+        assert_eq!(error.offset(), None);
+
+        // ...and the same crafted payload through the string entry point.
+        let xdr = meta.to_xdr_base64(Limits::none()).unwrap();
+        let error = XdrTransactionResultDecoder::decode_soroban_meta_xdr(&xdr).unwrap_err();
+        assert!(matches!(error, XdrDecodeError::CorruptPayload(_)));
+    }
+
+    #[test]
+    fn decode_propagates_malformed_envelope_error() {
+        let meta = SorobanTransactionMeta {
+            ext: SorobanTransactionMetaExt::V0,
+            events: VecM::default(),
+            return_value: ScVal::U32(7),
+            diagnostic_events: VecM::default(),
+        };
+        let xdr = meta.to_xdr_base64(Limits::none()).unwrap();
+        let error =
+            XdrTransactionResultDecoder::decode(&xdr, Some("!!! not base64 !!!")).unwrap_err();
         assert!(matches!(error, XdrDecodeError::InvalidBase64 { .. }));
+    }
+
+    #[test]
+    fn all_entry_points_return_err_for_arbitrary_garbage() {
+        let garbage = BASE64.encode(b"\x00\x01\x02\x03\x04\x05\x06\x07");
+        assert!(XdrTransactionResultDecoder::decode_result_meta(&garbage).is_err());
+        assert!(XdrTransactionResultDecoder::decode_soroban_meta_xdr(&garbage).is_err());
+        assert!(XdrTransactionResultDecoder::decode_envelope(&garbage).is_err());
+        assert!(XdrTransactionResultDecoder::decode(&garbage, Some(&garbage)).is_err());
     }
 }
